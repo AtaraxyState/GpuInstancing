@@ -1,0 +1,22 @@
+{
+    "name": "com.nyx.gpuinstancing",
+    "version": "1.0.0",
+    "displayName": "Nyx GPU Instancing",
+    "description": "Instanciateur GPU pour sargasses flottantes et bulles sous-marines : culling GPU par caméra (compute shader), DrawMeshInstancedIndirect, LODs, VR. Menus GameObject > Nyx > GPU Instancing et Tools > Nyx > GPU Instancing. Pipeline Built-in.",
+    "unity": "2021.3",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/AtaraxyState/GpuInstancing.git"
+    },
+    "author": {
+        "name": "Studio Nyx"
+    },
+    "keywords": [
+        "instancing",
+        "gpu",
+        "sargassum",
+        "bubbles",
+        "ocean"
+    ]
+}

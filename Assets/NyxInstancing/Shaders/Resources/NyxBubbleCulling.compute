@@ -1,0 +1,65 @@
+// Culling GPU + simulation analytique des bulles (utilisé par BubbleField.cs).
+// Aucune donnée n'est renvoyée par le CPU à chaque frame : la position est une fonction du temps.
+#pragma kernel NyxCull
+#pragma kernel NyxWriteArgs
+
+#include "../ShaderLibrary/InstancingData.hlsl"
+#include "../ShaderLibrary/OceanWaves.hlsl"
+
+float  _NyxTime;
+float4 _BubbleShape;   // x : aplatissement max, y : rayon (m) d'aplatissement max, z : vitesse d'oscillation (rad/s), w : distance d'éclatement (m)
+float4 _BubbleTiming;  // x : durée d'apparition (s)
+
+// Disposition écrite par BubbleField.cs :
+//   row0 : xyz = point d'émission (monde), w = instant d'émission (s)
+//   row1 : x = rayon en surface (m), y = vitesse de montée (m/s), z = durée de vie ou période (s), w = 1 boucle / 0 ponctuelle
+//   row2 : x = rayon de la spirale (m), y = tours par seconde, z = graine 0..1
+//   custom.w = variante (0)
+bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)
+{
+    dst = (NyxRenderData)0;
+
+    float period = src.row1.z;
+    float age = _NyxTime - src.row0.w;
+    if (src.row1.w > 0.5)
+        age -= period * floor(age / period);        // boucle infinie (modulo positif)
+    if (age < 0 || age >= period)
+        return false;
+
+    // Montée en spirale (les bulles de quelques mm zigzaguent / spiralent)
+    float seed = src.row2.z;
+    float s, c;
+    sincos(6.28318530718 * (src.row2.y * age + seed), s, c);
+    float3 position = src.row0.xyz;
+    position.y += src.row1.y * age;
+    position.xz += float2(c, s) * src.row2.x;
+
+    // Éclate en atteignant la surface (vagues comprises)
+    float depth = NyxWaveHeight(position.xz, _NyxWaveTime) - position.y;
+    if (depth <= 0)
+        return false;
+
+    // Loi de Boyle : V ~ 1/P avec P(d) = 1 + d / 10,33 atm, donc r = r_surface * (1 + d / 10,33)^(-1/3).
+    // Une bulle qui part de 20 m arrive en surface avec un rayon x1,44.
+    float radius = src.row1.x * pow(1.0 + depth * (1.0 / 10.33), -1.0 / 3.0);
+
+    // Apparition (grossit en _BubbleTiming.x secondes) et éclatement (rétrécit sur les derniers cm)
+    float pop = saturate(depth / max(_BubbleShape.w, 1e-3));
+    radius *= saturate(age / max(_BubbleTiming.x, 1e-3)) * pop;
+    if (radius < 1e-5)
+        return false;
+
+    // Forme : ellipsoïde aplati qui oscille, d'autant plus que la bulle est grosse
+    float flatness = _BubbleShape.x * saturate(radius / max(_BubbleShape.y, 1e-4));
+    flatness *= 0.75 + 0.25 * sin(_NyxTime * _BubbleShape.z + seed * 40.0);
+    float horizontal = radius * (1.0 + 0.5 * flatness);
+    float vertical   = radius * (1.0 - flatness);
+
+    dst.row0 = float4(horizontal, 0, 0, position.x);
+    dst.row1 = float4(0, vertical, 0, position.y);
+    dst.row2 = float4(0, 0, horizontal, position.z);
+    dst.custom = float4(seed, age / period, depth, pop);   // w : opacité utilisée par le shader
+    return true;
+}
+
+#include "../ShaderLibrary/InstancingCulling.hlsl"

@@ -1,0 +1,57 @@
+// Culling GPU + flottaison des sargasses (utilisé par SargassumField.cs).
+#pragma kernel NyxCull
+#pragma kernel NyxWriteArgs
+
+#include "../ShaderLibrary/InstancingData.hlsl"
+#include "../ShaderLibrary/OceanWaves.hlsl"
+
+float  _NyxTime;
+float4 _SargassumFloat;   // x : décalage vertical (m), y : amplitude du dandinement (m), z : vitesse (rad/s), w : suivi de la pente 0..1
+float4 _SargassumWander;  // x : rayon de dérive (m), y : vitesse de dérive (rad/s)
+
+// Rotation qui amène le vecteur unitaire 'from' sur 'to' (Möller & Hughes), sans trigonométrie.
+float3x3 NyxFromToRotation(float3 from, float3 to)
+{
+    float3 v = cross(from, to);
+    float c = dot(from, to);
+    float k = 1.0 / (1.0 + c);
+    return float3x3(
+        v.x * v.x * k + c,    v.x * v.y * k - v.z,  v.x * v.z * k + v.y,
+        v.y * v.x * k + v.z,  v.y * v.y * k + c,    v.y * v.z * k - v.x,
+        v.z * v.x * k - v.y,  v.z * v.y * k + v.x,  v.z * v.z * k + c);
+}
+
+// Disposition écrite par SargassumField.cs :
+//   row0..row2 : matrice de repos 3x4 (lacet + échelle), translation x et z (y ignoré)
+//   custom     : x = graine 0..1, y = profondeur dans la couche d'algues (m, >= 0), w = variante
+bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)
+{
+    dst = (NyxRenderData)0;
+    float seed = src.custom.x;
+    float phase = seed * 6.28318530718;
+
+    // Dérive lente autour de la position de repos : vivant, mais la mine reste couverte.
+    float wanderAngle = _NyxTime * _SargassumWander.y + phase;
+    float2 xz = float2(src.row0.w, src.row2.w)
+              + float2(cos(wanderAngle), sin(wanderAngle * 0.83 + 1.7)) * _SargassumWander.x;
+
+    // Flottaison : la touffe suit la particule d'eau (orbites de Gerstner) + léger dandinement propre.
+    float3 normal;
+    float3 displacement = NyxWaveDisplacement(xz, _NyxWaveTime, normal);
+    float3 position = float3(xz.x, _NyxWaterLevel, xz.y) + displacement;
+    position.y += _SargassumFloat.x + sin(_NyxTime * _SargassumFloat.z + phase) * _SargassumFloat.y - src.custom.y;
+
+    // Inclinaison sur la pente de la vague
+    float3 up = normalize(lerp(float3(0, 1, 0), normal, _SargassumFloat.w));
+    float3x3 tilt = NyxFromToRotation(float3(0, 1, 0), up);
+    float3x3 rest = float3x3(src.row0.xyz, src.row1.xyz, src.row2.xyz);
+    float3x3 m = mul(tilt, rest);
+
+    dst.row0 = float4(m[0], position.x);
+    dst.row1 = float4(m[1], position.y);
+    dst.row2 = float4(m[2], position.z);
+    dst.custom = float4(seed, displacement.y, 0, 1);
+    return true;
+}
+
+#include "../ShaderLibrary/InstancingCulling.hlsl"

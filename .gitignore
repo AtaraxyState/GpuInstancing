@@ -107,3 +107,9 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# NyxInstancing : scènes et assets régénérés à chaque test de fumée
+/[Aa]ssets/NyxInstancingTest/
+/[Aa]ssets/NyxInstancingTest.meta
+/[Aa]ssets/NyxGpuInstancingTest/
+/[Aa]ssets/NyxGpuInstancingTest.meta
