@@ -10,8 +10,10 @@
 //
 // Par caméra et par frame :
 //   NyxCull      : 1 thread par instance -> évaluation, distance, petits objets, frustum (2 yeux), LOD,
-//                  puis écriture compactée dans la zone du draw (variante x LOD) correspondant.
+//                  puis écriture des données de rendu UNE fois dans _NyxVisible (compacté, toutes variantes),
+//                  et de leur index (4 octets) dans la zone du draw (variante x LOD) de _NyxVisibleIndex.
 //   NyxWriteArgs : 1 thread par draw -> nombre d'instances dans les arguments indirects, remise à zéro.
+// Mémoire par jeu de buffers : visibles x 64 octets + pire cas par draw x 4 octets (au lieu de 64 octets par LOD).
 
 #include "InstancingData.hlsl"
 
@@ -20,9 +22,10 @@
 
 StructuredBuffer<NyxInstanceData>  _NyxInstances;
 StructuredBuffer<NyxVariantInfo>   _NyxVariants;
-StructuredBuffer<uint>             _NyxBucketOffsets;
-RWStructuredBuffer<NyxRenderData>  _NyxVisible;
-RWStructuredBuffer<uint>           _NyxCounters;
+StructuredBuffer<uint>             _NyxBucketOffsets;   // début de la zone d'index de chaque draw
+RWStructuredBuffer<NyxRenderData>  _NyxVisible;         // données de rendu des instances visibles, compactées
+RWStructuredBuffer<uint>           _NyxVisibleIndex;    // par draw : index dans _NyxVisible
+RWStructuredBuffer<uint>           _NyxCounters;        // [draw] : instances du draw ; [_NyxBucketCount] : total visible
 // Buffer de type IndirectArguments : vue DX11 typée R32_UINT, donc RWBuffer<uint> et non RWStructuredBuffer.
 RWBuffer<uint>                     _NyxArgs;
 
@@ -38,6 +41,8 @@ float4 _NyxShadowSweep;         // xyz : demi-vecteur d'extrusion le long de la 
 
 groupshared uint gs_Count[NYX_MAX_BUCKETS];
 groupshared uint gs_Base[NYX_MAX_BUCKETS];
+groupshared uint gs_Total;
+groupshared uint gs_TotalBase;
 
 bool NyxAabbInsidePlanes(float3 center, float3 extents, uint firstPlane)
 {
@@ -100,12 +105,15 @@ void NyxCull(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
     // Compteurs du groupe à zéro
     for (uint b = threadIndex; b < _NyxBucketCount; b += NYX_THREADS)
         gs_Count[b] = 0;
+    if (threadIndex == 0)
+        gs_Total = 0;
     GroupMemoryBarrierWithGroupSync();
 
     uint instanceIndex = (groupId.y * _NyxGroupsX + groupId.x) * NYX_THREADS + threadIndex;
     bool visible = false;
     uint bucket = 0;
     uint slotInGroup = 0;
+    uint dataInGroup = 0;
     NyxRenderData dst = (NyxRenderData)0;
 
     if (instanceIndex < _NyxInstanceCount)
@@ -118,7 +126,10 @@ void NyxCull(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
     // Réservation en 2 temps : atomique en mémoire partagée, puis 1 seule atomique globale
     // par groupe et par draw (au lieu d'une par instance) -> 64x moins de contention.
     if (visible)
+    {
         InterlockedAdd(gs_Count[bucket], 1, slotInGroup);
+        InterlockedAdd(gs_Total, 1, dataInGroup);
+    }
     GroupMemoryBarrierWithGroupSync();
 
     for (uint b2 = threadIndex; b2 < _NyxBucketCount; b2 += NYX_THREADS)
@@ -129,10 +140,21 @@ void NyxCull(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
             InterlockedAdd(_NyxCounters[b2], groupCount, groupBase);
         gs_Base[b2] = groupBase;
     }
+    if (threadIndex == 0)
+    {
+        uint totalBase = 0;
+        if (gs_Total > 0)
+            InterlockedAdd(_NyxCounters[_NyxBucketCount], gs_Total, totalBase);
+        gs_TotalBase = totalBase;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     if (visible)
-        _NyxVisible[_NyxBucketOffsets[bucket] + gs_Base[bucket] + slotInGroup] = dst;
+    {
+        uint dataIndex = gs_TotalBase + dataInGroup;
+        _NyxVisible[dataIndex] = dst;
+        _NyxVisibleIndex[_NyxBucketOffsets[bucket] + gs_Base[bucket] + slotInGroup] = dataIndex;
+    }
 }
 
 [numthreads(NYX_THREADS, 1, 1)]
@@ -149,6 +171,8 @@ void NyxWriteArgs(uint3 dispatchId : SV_DispatchThreadID)
     _NyxArgs[bucket * 5 + 1] = visibleCount * _NyxInstanceMultiplier;
     _NyxArgs[(_NyxBucketCount + bucket) * 5 + 1] = visibleCount;
     _NyxCounters[bucket] = 0;
+    if (bucket == 0)
+        _NyxCounters[_NyxBucketCount] = 0;   // total des visibles
 }
 
 #endif // NYX_INSTANCING_CULLING_INCLUDED

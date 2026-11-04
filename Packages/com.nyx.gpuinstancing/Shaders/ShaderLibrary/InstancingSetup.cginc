@@ -11,13 +11,14 @@
 #include "InstancingData.hlsl"
 
 #if defined(UNITY_PROCEDURAL_INSTANCING_ENABLED)
-    StructuredBuffer<NyxRenderData> _NyxRenderData;
-    float _NyxBucketOffset;   // début de la zone de ce draw (float : posé via MaterialPropertyBlock.SetFloat)
+    StructuredBuffer<NyxRenderData> _NyxRenderData;    // instances visibles, compactées (toutes variantes)
+    StructuredBuffer<uint> _NyxRenderIndex;            // par draw : index dans _NyxRenderData
+    float _NyxBucketOffset;   // début de la zone d'index de ce draw (float : posé via MaterialPropertyBlock.SetFloat)
 
     NyxRenderData NyxGetRenderData()
     {
         // unity_InstanceID est déjà corrigé pour la VR Single Pass Instanced (SV_InstanceID >> 1).
-        return _NyxRenderData[(uint)_NyxBucketOffset + unity_InstanceID];
+        return _NyxRenderData[_NyxRenderIndex[(uint)_NyxBucketOffset + unity_InstanceID]];
     }
 #endif
 

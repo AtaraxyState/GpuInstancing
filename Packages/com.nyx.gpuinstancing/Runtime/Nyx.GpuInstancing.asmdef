@@ -1,7 +1,10 @@
 {
     "name": "Nyx.GpuInstancing",
     "rootNamespace": "Nyx.GpuInstancing",
-    "references": [],
+    "references": [
+        "Unity.Burst",
+        "Unity.Mathematics"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

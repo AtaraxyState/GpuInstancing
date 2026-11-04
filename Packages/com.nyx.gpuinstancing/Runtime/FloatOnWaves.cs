@@ -1,4 +1,8 @@
 using System.Collections.Generic;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace Nyx.GpuInstancing
@@ -40,13 +44,31 @@ namespace Nyx.GpuInstancing
         public float GetLayerDepth(MeshPlacement placement) => layerThickness * LayerDepthFraction(placement.seed);
 
         /// <summary>Matrice de repos : lacet + échelle, translation XZ (la hauteur et l'inclinaison viennent des vagues, sur GPU).</summary>
-        public override GpuInstanceData CreateInstance(MeshPlacement placement)
+        public override GpuInstanceData CreateInstance(MeshPlacement placement) => Instance(placement, layerThickness);
+
+        /// <summary>Toutes les instances en un job Burst parallèle, en mémoire native.</summary>
+        public override void CreateInstances(NativeArray<MeshPlacement> placements, NativeArray<GpuInstanceData> output)
         {
-            Matrix4x4 rest = Matrix4x4.TRS(new Vector3(placement.position.x, 0f, placement.position.z),
-                Quaternion.Euler(0f, placement.yaw, 0f), Vector3.one * placement.scale);
-            GpuInstanceData data = GpuInstanceData.FromMatrix(rest, placement.variant, placement.seed);
-            data.custom.y = GetLayerDepth(placement);
+            new InstancesJob { placements = placements, output = output, layerThickness = layerThickness }
+                .Schedule(placements.Length, MeshSpawnerJobs.BatchSize).Complete();
+        }
+
+        static GpuInstanceData Instance(MeshPlacement placement, float layerThickness)
+        {
+            Vector3 p = placement.position;
+            GpuInstanceData data = MeshSpawnerJobs.TrsInstance(new float3(p.x, 0f, p.z), placement.yaw, placement.scale, placement.seed, placement.variant);
+            data.custom.y = layerThickness * LayerDepthFraction(placement.seed);
             return data;
+        }
+
+        [BurstCompile(CompileSynchronously = true)]
+        struct InstancesJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<MeshPlacement> placements;
+            [WriteOnly] public NativeArray<GpuInstanceData> output;
+            public float layerThickness;
+
+            public void Execute(int index) => output[index] = Instance(placements[index], layerThickness);
         }
 
         /// <summary>Toutes les positions possibles : taille des instances + houle + dérive + dandinement + couche (vers le bas).</summary>
@@ -106,7 +128,7 @@ namespace Nyx.GpuInstancing
         /// </summary>
         static float LayerDepthFraction(float seed)
         {
-            uint h = (uint)(Mathf.Clamp01(seed) * 16777215f);
+            uint h = (uint)(math.saturate(seed) * 16777215f);
             h ^= h >> 16;
             h *= 0x7feb352dU;
             h ^= h >> 15;

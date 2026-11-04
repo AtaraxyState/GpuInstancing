@@ -358,6 +358,15 @@ namespace Nyx.GpuInstancing.Editor
             report.notes.Add($"Rochers : {rocks.InstanceCount} instances, {rocks.DrawCallsPerCamera} draws, {rocks.GpuMemoryBytes / 1024} Ko GPU");
             report.notes.Add($"Rendu complet Cam_Surface avec l'eau (éditeur, CPU) : {watch.Elapsed.TotalMilliseconds / frames:F2} ms en moyenne sur {frames} images");
 
+            // ---------------------------------------------------------------- 13. Mémoire
+            report.Check(sargassum.CullingBufferSets == 1 && bubbles.CullingBufferSets == 1 && rocks.CullingBufferSets == 1,
+                "Mémoire GPU : un seul jeu de buffers de culling pour toutes les caméras rendues l'une après l'autre",
+                $"sargasses {sargassum.CullingBufferSets}, bulles {bubbles.CullingBufferSets}, rochers {rocks.CullingBufferSets} (5 caméras du test)");
+            int placementSize = System.Runtime.InteropServices.Marshal.SizeOf<MeshPlacement>();
+            report.Check(sargassum.CpuMemoryBytes == (long)sargassum.InstanceCount * placementSize && bubbles.CpuMemoryBytes == 0,
+                "Mémoire CPU : seuls les placements restent après la reconstruction (mémoire native)",
+                $"sargasses {sargassum.CpuMemoryBytes / 1024} Ko ({placementSize} o par instance), bulles {bubbles.CpuMemoryBytes} o");
+
             Object.DestroyImmediate(surfaceCamera.gameObject);
             Object.DestroyImmediate(skyCamera.gameObject);
             Object.DestroyImmediate(underwaterCamera.gameObject);

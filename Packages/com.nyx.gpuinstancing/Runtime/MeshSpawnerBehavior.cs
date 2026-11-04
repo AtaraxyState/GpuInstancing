@@ -1,4 +1,8 @@
+using System;
 using System.Collections.Generic;
+using System.Reflection;
+using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
 
 namespace Nyx.GpuInstancing
@@ -25,6 +29,7 @@ namespace Nyx.GpuInstancing
     ///     </code>
     ///  2. une classe qui hérite de MeshSpawnerBehavior et donne le chemin de ce compute shader (CullingShaderResource).
     ///     Les autres méthodes sont facultatives : paramètres du shader, données par instance, bounds, instances propres.
+    ///     Les instances sont construites en mémoire native (NativeArray) ; par défaut par un job Burst.
     ///
     /// Données d'instance (64 octets) : row0..row2 = matrice 3x4 objet -> monde par défaut, custom.x = graine 0..1,
     /// custom.y/z = libres, custom.w = index de variante (ne pas modifier). Le compute shader écrit dans dst.custom
@@ -54,12 +59,44 @@ namespace Nyx.GpuInstancing
         /// <summary>
         /// Donnée GPU d'une instance placée. Défaut : matrice position + lacet + échelle, graine en custom.x.
         /// Surcharger pour y écrire des données propres au comportement (custom.y/z, ou une autre interprétation des lignes).
+        /// Simple mais en C# classique, une instance après l'autre : pour des centaines de milliers d'instances, surcharger
+        /// plutôt CreateInstances avec un job Burst.
         /// </summary>
-        public virtual GpuInstanceData CreateInstance(MeshPlacement placement)
+        public virtual GpuInstanceData CreateInstance(MeshPlacement placement) =>
+            MeshSpawnerJobs.TrsInstance(placement.position, placement.yaw, placement.scale, placement.seed, placement.variant);
+
+        /// <summary>
+        /// Toutes les instances d'un coup, en mémoire native (output a la taille de placements). Défaut : job Burst parallèle
+        /// (matrice position + lacet + échelle), ou CreateInstance pour chaque placement si le comportement le surcharge.
+        /// </summary>
+        public virtual void CreateInstances(NativeArray<MeshPlacement> placements, NativeArray<GpuInstanceData> output)
         {
-            Matrix4x4 matrix = Matrix4x4.TRS(placement.position, Quaternion.Euler(0f, placement.yaw, 0f), Vector3.one * placement.scale);
-            return GpuInstanceData.FromMatrix(matrix, placement.variant, placement.seed);
+            if (OverridesCreateInstance)
+            {
+                for (int i = 0; i < placements.Length; i++)
+                    output[i] = CreateInstance(placements[i]);
+                return;
+            }
+            new MeshSpawnerJobs.TrsInstancesJob { placements = placements, output = output }
+                .Schedule(placements.Length, MeshSpawnerJobs.BatchSize).Complete();
         }
+
+        bool OverridesCreateInstance
+        {
+            get
+            {
+                Type type = GetType();
+                if (!s_OverridesCreateInstance.TryGetValue(type, out bool overrides))
+                {
+                    MethodInfo method = type.GetMethod(nameof(CreateInstance), new[] { typeof(MeshPlacement) });
+                    overrides = method != null && method.DeclaringType != typeof(MeshSpawnerBehavior);
+                    s_OverridesCreateInstance.Add(type, overrides);
+                }
+                return overrides;
+            }
+        }
+
+        static readonly Dictionary<Type, bool> s_OverridesCreateInstance = new Dictionary<Type, bool>();
 
         /// <summary>
         /// Bounds monde couvrant toutes les positions possibles des instances (mouvement compris), pour le culling CPU
@@ -72,8 +109,14 @@ namespace Nyx.GpuInstancing
             return positions;
         }
 
-        /// <summary>Pour UsesPlacement = false : remplit 'output' et renvoie les bounds monde de toutes les positions possibles.</summary>
-        public virtual Bounds BuildInstances(List<GpuInstanceData> output) => new Bounds(transform.position, Vector3.zero);
+        /// <summary>Pour UsesPlacement = false : nombre d'instances que BuildInstances va écrire.</summary>
+        public virtual int GetInstanceCount() => 0;
+
+        /// <summary>
+        /// Pour UsesPlacement = false : remplit 'output' (taille GetInstanceCount(), mémoire native libérée après l'envoi au GPU)
+        /// et renvoie les bounds monde de toutes les positions possibles.
+        /// </summary>
+        public virtual Bounds BuildInstances(NativeArray<GpuInstanceData> output) => new Bounds(transform.position, Vector3.zero);
 
         /// <summary>Paramètres posés sur le compute shader avant chaque dispatch (une fois par caméra et par frame).</summary>
         public virtual void SetShaderParameters(ComputeShader shader, Camera camera) { }

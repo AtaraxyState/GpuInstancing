@@ -5,6 +5,7 @@ Des milliers de copies de meshes (sargasses flottantes, bulles sous-marines, roc
 - Unity 2021.3 et plus, pipeline **Built-in**, PC et VR (Single Pass Instanced, multiview).
 - Un composant **`Mesh Spawner`** + un **comportement** au choix, qui décide comment les instances bougent. Trois sont fournis, et en écrire un ne demande qu'une classe courte et un compute shader.
 - Prêt à l'emploi : meshes, matériaux et compute shaders par défaut sont fournis et assignés automatiquement.
+- Dépendances installées automatiquement par le Package Manager : Burst 1.8.26 et Mathematics 1.2.6 (construction des instances en jobs Burst, en mémoire native).
 
 ## Installation
 
@@ -109,9 +110,10 @@ Méthodes facultatives de `MeshSpawnerBehavior` :
 | Méthode | Rôle | Par défaut |
 |---|---|---|
 | `SetShaderParameters(shader, camera)` | Paramètres du compute shader, avant chaque dispatch. | rien |
-| `CreateInstance(placement)` | Donnée GPU d'une instance placée (64 octets : `row0..row2`, `custom`). Y écrire `custom.y/z` ou une autre interprétation des lignes. | matrice position + lacet + échelle, graine en `custom.x` |
+| `CreateInstance(placement)` | Donnée GPU d'une instance placée (64 octets : `row0..row2`, `custom`). Y écrire `custom.y/z` ou une autre interprétation des lignes. Simple, mais en C# classique, une instance après l'autre. | matrice position + lacet + échelle, graine en `custom.x` |
+| `CreateInstances(placements, output)` | La même chose pour toutes les instances, en `NativeArray` : pour des centaines de milliers d'instances, y lancer un job Burst (voir `FloatOnWaves`). | job Burst parallèle (ou `CreateInstance` s'il est surchargé) |
 | `GetPlacementBounds(positions, meshRadius)` | Boîte monde de toutes les positions possibles (culling du spawner entier). | positions + rayon des meshes |
-| `UsesPlacement` + `BuildInstances(output)` | `false` : le comportement fournit ses propres instances (comme `Bubble Columns`). | `true` |
+| `UsesPlacement` + `GetInstanceCount()` + `BuildInstances(output)` | `false` : le comportement fournit ses propres instances (comme `Bubble Columns`) dans une `NativeArray` de la taille annoncée. | `true` |
 | `GetBoundsPadding(variant, localBounds, default)` | Marge si le vertex shader déforme les meshes. | réglage du spawner |
 | `CreateDefaultVariants()` | Meshes et matériau donnés au spawner à l'ajout (éditeur). | aucun |
 
@@ -145,11 +147,24 @@ Avec une eau d'asset (Crest, KWS...) : régler `Ocean Waves` pour imiter sa houl
 
 ## Fonctionnement
 
-1. Les instances sont envoyées **une fois** au GPU (64 octets chacune).
-2. Chaque frame, pour chaque caméra, le compute shader du comportement calcule la position finale de chaque instance ; le culling commun rejette ce qui est hors champ (les deux yeux en VR), trop loin ou plus petit qu'un pixel, choisit le LOD et range les instances visibles.
+1. Les instances sont construites par des jobs Burst en mémoire native, puis envoyées **une fois** au GPU (64 octets chacune) ; la mémoire de construction est libérée aussitôt.
+2. Chaque frame, pour chaque caméra, le compute shader du comportement calcule la position finale de chaque instance ; le culling commun rejette ce qui est hors champ (les deux yeux en VR), trop loin ou plus petit qu'un pixel, choisit le LOD et écrit chaque instance visible une seule fois, avec son index (4 octets) dans la liste de son draw.
 3. Un `DrawMeshInstancedIndirect` par (variante × LOD), pour 100 ou 1 000 000 d'instances.
 
 Mesures (test de fumée, RTX 4070, éditeur 2021.3) : 460 touffes en 4 draws, 692 bulles en 3 draws, 196 rochers en 2 draws ; rendu complet de la vue de surface avec l'eau ≈ 0,4 ms CPU.
+
+## Mémoire
+
+| | Formule | 1 000 000 d'instances, 2 LODs |
+|---|---|---|
+| CPU, entre deux reconstructions | placements : N × 28 o, mémoire native (rien dans le tas managé) | 27 Mo |
+| CPU, pendant une reconstruction | + N × 64 o en mémoire native, libérés après l'envoi au GPU | + 61 Mo, quelques dizaines de ms |
+| GPU, instances | N × 64 o | 61 Mo |
+| GPU, culling | N × 64 o + N × LODs × 4 o, **un seul jeu pour toutes les caméras rendues l'une après l'autre** | 69 Mo |
+
+- Les caméras rendues l'une après l'autre (vue Game, vue Scene, écran partagé) partagent le même jeu de buffers de culling. Une caméra rendue pendant le rendu d'une autre (réflexion d'eau via `Camera.Render`) en prend un second ; `CullingBufferSets` donne le nombre de jeux.
+- Diagnostic : `GpuMemoryBytes`, `CpuMemoryBytes`, `CullingBufferSets` sur le Mesh Spawner.
+- Mesuré sur 1 000 000 d'instances et 2 caméras, avant / après cette organisation : mémoire C# retenue 153 Mo → 0, GPU 305 Mo → 130 Mo, reconstruction 1,8 s → 50 ms. Le tas Mono d'Unity ne rend jamais la mémoire au système : éviter les gros tableaux C# évite qu'il grossisse pour de bon.
 
 ## VR
 

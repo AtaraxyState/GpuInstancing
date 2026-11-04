@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Collections;
 using UnityEngine;
 
 namespace Nyx.GpuInstancing
@@ -146,12 +147,26 @@ namespace Nyx.GpuInstancing
                 UploadBurst(0, count - firstPart);
         }
 
-        public override Bounds BuildInstances(List<GpuInstanceData> output)
+        /// <summary>Bulles des colonnes valides (sous l'eau) + tampon des émissions ponctuelles.</summary>
+        public override int GetInstanceCount()
+        {
+            int count = 0;
+            float waterLevel = OceanWaves.WaterLevel;
+            foreach (BubbleEmitter emitter in emitters)
+            {
+                if (EmitsBubbles(emitter, waterLevel))
+                    count += emitter.bubbleCount;
+            }
+            return count + burstCapacity;
+        }
+
+        public override Bounds BuildInstances(NativeArray<GpuInstanceData> output)
         {
             var random = new System.Random(randomSeed);
             float waterLevel = OceanWaves.WaterLevel;
             float waveMargin = OceanWaves.MaxVerticalDisplacement;
             var bounds = new Bounds(transform.position, Vector3.zero);
+            int written = 0;
 
             // 1. Colonnes en boucle : chaque bulle a une phase aléatoire, la colonne est pleine dès t = 0
             _emitterPositions.Clear();
@@ -159,9 +174,9 @@ namespace Nyx.GpuInstancing
             {
                 Vector3 origin = emitter != null ? EmitterPosition(emitter) : Vector3.zero;
                 _emitterPositions.Add(origin);
-                float travel = waterLevel - origin.y;
-                if (emitter == null || emitter.bubbleCount <= 0 || travel <= 0.05f)
+                if (!EmitsBubbles(emitter, waterLevel))
                     continue;
+                float travel = waterLevel - origin.y;
 
                 for (int i = 0; i < emitter.bubbleCount; i++)
                 {
@@ -169,9 +184,9 @@ namespace Nyx.GpuInstancing
                     float period = (travel + waveMargin) / speed;
                     Vector2 offset = RandomInDisk(random) * emitter.radius;
                     var spawn = new Vector3(origin.x + offset.x, origin.y, origin.z + offset.y);
-                    output.Add(MakeBubble(
+                    output[written++] = MakeBubble(
                         spawn, -Next(random) * period, Lerp(emitter.surfaceRadius, Next(random)), speed, period, true,
-                        emitter.spiralRadius, emitter.spiralFrequency * Mathf.Lerp(0.7f, 1.3f, Next(random)), Next(random)));
+                        emitter.spiralRadius, emitter.spiralFrequency * Mathf.Lerp(0.7f, 1.3f, Next(random)), Next(random));
                 }
 
                 float side = 2f * (emitter.radius + emitter.spiralRadius + emitter.surfaceRadius.y * 2f);
@@ -179,14 +194,17 @@ namespace Nyx.GpuInstancing
                     new Vector3(origin.x, (origin.y + waterLevel) * 0.5f, origin.z),
                     new Vector3(side, travel + 2f * waveMargin, side)));
             }
-            _ambientCount = output.Count;
+            _ambientCount = written;
 
             // 2. Tampon circulaire des émissions ponctuelles (conservé d'une reconstruction à l'autre ;
             //    ses bounds sont gérées à part, par zones qui expirent : voir RefreshBurstBounds)
             EnsureBurstBuffer();
-            output.AddRange(_burst);
+            NativeArray<GpuInstanceData>.Copy(_burst, 0, output, written, _burst.Length);
             return bounds;
         }
+
+        bool EmitsBubbles(BubbleEmitter emitter, float waterLevel) =>
+            emitter != null && emitter.bubbleCount > 0 && waterLevel - EmitterPosition(emitter).y > 0.05f;
 
         public override void SetShaderParameters(ComputeShader shader, Camera camera)
         {

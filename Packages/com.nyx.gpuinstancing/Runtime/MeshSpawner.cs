@@ -1,6 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Text;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.XR;
@@ -29,7 +33,14 @@ namespace Nyx.GpuInstancing
     /// (FloatOnWaves, BubbleColumns, StaticInstances, ou le vôtre) : il fournit le compute shader qui calcule la
     /// position finale de chaque instance, ses paramètres, et éventuellement ses propres instances.
     /// Le MeshSpawner gère le reste : meshes et LODs, placement (zone, amas, liste), culling (frustum des deux yeux,
-    /// distance, petits objets), buffers par caméra, VR, ombres.
+    /// distance, petits objets), buffers, VR, ombres.
+    ///
+    /// Mémoire :
+    ///  - CPU : construction dans des NativeArray par des jobs Burst, libérées dès l'envoi au GPU. Seuls les placements
+    ///    restent (28 octets par instance, mémoire native) ; rien de proportionnel au nombre d'instances dans le tas managé.
+    ///  - GPU : instances (64 o chacune) + un jeu de buffers de culling partagé par les caméras rendues l'une après
+    ///    l'autre (visibles × 64 o + index par draw × 4 o). Une caméra rendue PENDANT le rendu d'une autre (réflexion
+    ///    d'eau) prend un second jeu : les draws de la première gardent leurs données.
     /// </summary>
     [ExecuteAlways]
     [DisallowMultipleComponent]
@@ -96,28 +107,55 @@ namespace Nyx.GpuInstancing
         [SerializeField] bool logVisibleCounts;
 
         /// <summary>
-        /// Buffers propres à une caméra. Indispensable : une caméra peut en rendre une autre PENDANT son propre
-        /// rendu (réflexion d'eau via Camera.Render) ; avec des buffers partagés, la seconde écraserait les
-        /// résultats de culling dont les draws de la première ont encore besoin.
+        /// Jeu de buffers de culling. Partagé par les caméras rendues l'une après l'autre (vue Game puis vue Scene...) :
+        /// la caméra suivante ne lance son culling qu'après les draws de la précédente. Une caméra rendue pendant le rendu
+        /// d'une autre (réflexion d'eau via Camera.Render) prend un autre jeu.
         /// </summary>
-        sealed class CameraResources
+        sealed class CullingBuffers
         {
-            public ComputeBuffer visible;     // instances visibles compactées, une zone par draw
-            public ComputeBuffer counters;    // compteurs par draw (remis à zéro par NyxWriteArgs)
-            public ComputeBuffer args;        // arguments indirects : bloc caméra puis bloc ombre
+            public ComputeBuffer visible;        // données de rendu des instances visibles, compactées
+            public ComputeBuffer visibleIndex;   // par draw : index dans 'visible' (zone = pire cas du draw)
+            public ComputeBuffer counters;       // par draw + total (remis à zéro par NyxWriteArgs)
             public MaterialPropertyBlock[] blocks;
-            public uint lastMultiplier = 1;   // diagnostic : multiplicateur VR du dernier rendu
-            public bool skippedLastRender;    // diagnostic : spawner rejeté en entier côté CPU au dernier rendu
 
-            public long Bytes => Size(visible) + Size(counters) + Size(args);
+            public long Bytes => Size(visible) + Size(visibleIndex) + Size(counters);
 
             public void Release()
             {
                 visible?.Release();
+                visibleIndex?.Release();
                 counters?.Release();
-                args?.Release();
-                visible = counters = args = null;
+                visible = visibleIndex = counters = null;
             }
+        }
+
+        /// <summary>État propre à une caméra : ses arguments indirects (lus aussi par TryReadVisibleCounts) et le jeu qu'elle utilise.</summary>
+        sealed class CameraState
+        {
+            public ComputeBuffer args;           // bloc caméra puis bloc ombre
+            public CullingBuffers inUse;         // pris entre le début et la fin du rendu de la caméra
+            public uint lastMultiplier = 1;      // diagnostic : multiplicateur VR du dernier rendu
+            public bool skippedLastRender;       // diagnostic : spawner rejeté en entier côté CPU au dernier rendu
+        }
+
+        /// <summary>Vue en lecture seule des placements (mémoire native du spawner), sans copie.</summary>
+        sealed class PlacementList : IReadOnlyList<MeshPlacement>
+        {
+            readonly MeshSpawner _owner;
+
+            public PlacementList(MeshSpawner owner) => _owner = owner;
+
+            public int Count => _owner._placements.IsCreated ? _owner._placements.Length : 0;
+
+            public MeshPlacement this[int index] => _owner._placements[index];
+
+            public IEnumerator<MeshPlacement> GetEnumerator()
+            {
+                for (int i = 0; i < Count; i++)
+                    yield return _owner._placements[i];
+            }
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
         }
 
         // --- Données communes à toutes les caméras (reconstruites hors rendu) ---
@@ -126,13 +164,16 @@ namespace Nyx.GpuInstancing
         ComputeBuffer _bucketOffsetBuffer;
         ComputeShader _cullingShader;
         MeshSpawnerBehavior _behavior;
+        NativeArray<MeshPlacement> _placements;
+        PlacementList _placementList;
         Mesh[] _bucketMeshes = Array.Empty<Mesh>();
         Material[] _bucketMaterials = Array.Empty<Material>();
         int[] _bucketSubMeshes = Array.Empty<int>();
         string[] _bucketLabels = Array.Empty<string>();
         uint[] _bucketOffsets = Array.Empty<uint>();
         uint[] _argsTemplate = Array.Empty<uint>();
-        int _visibleSlots;
+        int _visibleCapacity;
+        int _indexCapacity;
         int _bucketCount;
         int _kernelCull = -1;
         int _kernelWriteArgs = -1;
@@ -144,12 +185,11 @@ namespace Nyx.GpuInstancing
         Bounds _buildBounds;
         Bounds? _dynamicBounds;
         Bounds _worldBounds;
-        GpuInstanceData[] _instances = Array.Empty<GpuInstanceData>();
-        readonly Dictionary<Camera, CameraResources> _cameraResources = new Dictionary<Camera, CameraResources>();
+        readonly Dictionary<Camera, CameraState> _cameras = new Dictionary<Camera, CameraState>();
+        readonly List<CullingBuffers> _allBuffers = new List<CullingBuffers>();
+        readonly Stack<CullingBuffers> _freeBuffers = new Stack<CullingBuffers>();
         readonly List<Camera> _deadCameras = new List<Camera>();
         readonly Vector4[] _planes = new Vector4[12];
-        readonly List<GpuInstanceData> _buildList = new List<GpuInstanceData>();
-        readonly List<MeshPlacement> _generated = new List<MeshPlacement>();
         readonly List<Vector3> _anchorPositions = new List<Vector3>();
 
         // ------------------------------------------------------------------------------------------
@@ -161,17 +201,25 @@ namespace Nyx.GpuInstancing
         /// <summary>Draw calls par caméra pour la passe principale (hors cascades d'ombre). Indépendant du nombre d'instances.</summary>
         public int DrawCallsPerCamera => _bucketCount;
 
-        /// <summary>Mémoire GPU occupée, toutes caméras comprises (octets).</summary>
+        /// <summary>Mémoire GPU occupée : instances, jeux de buffers de culling, arguments de chaque caméra (octets).</summary>
         public long GpuMemoryBytes
         {
             get
             {
                 long bytes = Size(_instanceBuffer) + Size(_variantBuffer) + Size(_bucketOffsetBuffer);
-                foreach (CameraResources resources in _cameraResources.Values)
-                    bytes += resources.Bytes;
+                foreach (CullingBuffers buffers in _allBuffers)
+                    bytes += buffers.Bytes;
+                foreach (CameraState state in _cameras.Values)
+                    bytes += Size(state.args);
                 return bytes;
             }
         }
+
+        /// <summary>Mémoire native CPU retenue entre deux reconstructions : les placements (octets).</summary>
+        public long CpuMemoryBytes => _placements.IsCreated ? (long)_placements.Length * System.Runtime.InteropServices.Marshal.SizeOf<MeshPlacement>() : 0L;
+
+        /// <summary>Jeux de buffers de culling alloués (1 tant qu'aucune caméra n'est rendue pendant le rendu d'une autre).</summary>
+        public int CullingBufferSets => _allBuffers.Count;
 
         /// <summary>
         /// Temps commun au culling GPU, aux vagues et aux émissions (s). Time.time ne repart pas de zéro
@@ -184,8 +232,11 @@ namespace Nyx.GpuInstancing
 
         public IReadOnlyList<InstanceVariant> Variants => variants;
 
-        /// <summary>Placements utilisés à la dernière reconstruction (vide si le comportement fournit ses propres instances).</summary>
-        public IReadOnlyList<MeshPlacement> Placements => source == PlacementSource.List ? (IReadOnlyList<MeshPlacement>)placements : _generated;
+        /// <summary>
+        /// Placements de la dernière reconstruction (vide si le comportement fournit ses propres instances). Lus sans copie
+        /// dans la mémoire native du spawner : valables jusqu'à la prochaine reconstruction.
+        /// </summary>
+        public IReadOnlyList<MeshPlacement> Placements => _placementList ??= new PlacementList(this);
 
         /// <summary>Libellé de chaque draw (« v0/LOD1 »...), dans l'ordre de TryReadVisibleCounts.</summary>
         public IReadOnlyList<string> DrawLabels => _bucketLabels;
@@ -227,15 +278,14 @@ namespace Nyx.GpuInstancing
 
         /// <summary>
         /// Pour les comportements qui modifient des instances sans reconstruction (ex. Emit des bulles) :
-        /// copie data[dataStart..+count] dans les instances à partir de 'start' et l'envoie au GPU (count × 64 octets).
+        /// envoie data[dataStart..+count] au GPU à partir de l'instance 'start' (count × 64 octets, sans copie CPU).
         /// Sans effet si le buffer n'est pas à jour (la prochaine reconstruction relira les données du comportement).
         /// </summary>
         public void UploadInstances(int start, GpuInstanceData[] data, int dataStart, int count)
         {
             if (!IsBuilt || count <= 0 || start < 0 || start + count > InstanceCount)
                 return;
-            Array.Copy(data, dataStart, _instances, start, count);
-            _instanceBuffer.SetData(_instances, start, start, count);
+            _instanceBuffer.SetData(data, dataStart, start, count);
         }
 
         /// <summary>Bounds supplémentaires qui évoluent sans reconstruction (ex. émissions en vol). null = aucune.</summary>
@@ -253,13 +303,13 @@ namespace Nyx.GpuInstancing
         public bool TryReadVisibleCounts(Camera camera, List<int> countsPerDraw)
         {
             countsPerDraw.Clear();
-            if (camera == null || !_cameraResources.TryGetValue(camera, out CameraResources resources) || resources.args == null)
+            if (camera == null || !_cameras.TryGetValue(camera, out CameraState state) || state.args == null)
                 return false;
 
-            var args = new uint[resources.args.count];
-            if (!resources.skippedLastRender)
-                resources.args.GetData(args);
-            uint multiplier = resources.lastMultiplier == 0 ? 1u : resources.lastMultiplier;
+            var args = new uint[state.args.count];
+            if (!state.skippedLastRender)
+                state.args.GetData(args);
+            uint multiplier = state.lastMultiplier == 0 ? 1u : state.lastMultiplier;
             for (int b = 0; b < _bucketCount; b++)
                 countsPerDraw.Add((int)(args[b * ArgsPerDraw + 1] / multiplier));
             return true;
@@ -271,8 +321,10 @@ namespace Nyx.GpuInstancing
 #if UNITY_EDITOR
             UnityEditor.Undo.RecordObject(this, "Figer le placement");
 #endif
-            GeneratePlacements(_generated);
-            placements = new List<MeshPlacement>(_generated);
+            GeneratePlacements();
+            placements = new List<MeshPlacement>(_placements.Length);
+            for (int i = 0; i < _placements.Length; i++)
+                placements.Add(_placements[i]);
             source = PlacementSource.List;
             SetDirty();
 #if UNITY_EDITOR
@@ -288,16 +340,22 @@ namespace Nyx.GpuInstancing
         {
             SetDirty();
             Camera.onPreCull += OnCameraPreCull;                                    // Built-in
+            Camera.onPostRender += OnCameraPostRender;
             RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;   // SRP (les shaders fournis restent Built-in)
+            RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
             OceanWaves.Changed += SetDirty;
         }
 
         void OnDisable()
         {
             Camera.onPreCull -= OnCameraPreCull;
+            Camera.onPostRender -= OnCameraPostRender;
             RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
+            RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
             OceanWaves.Changed -= SetDirty;
-            ReleaseAll();
+            ReleaseRenderResources();
+            ReleaseInstanceBuffer();
+            DisposePlacements();
         }
 
         void OnValidate()
@@ -339,28 +397,42 @@ namespace Nyx.GpuInstancing
             }
         }
 
-        /// <summary>Reconstruction différée + libération des ressources des caméras détruites. Toujours hors rendu.</summary>
+        /// <summary>Reconstruction différée, ressources des caméras détruites, jeux de buffers non rendus. Toujours hors rendu.</summary>
         void LateUpdate()
         {
             if (_dirty)
                 Rebuild();
 
-            foreach (KeyValuePair<Camera, CameraResources> pair in _cameraResources)
+            foreach (KeyValuePair<Camera, CameraState> pair in _cameras)
             {
                 if (pair.Key == null)
                     _deadCameras.Add(pair.Key);
+                else
+                    ReturnBuffers(pair.Value);   // aucun rendu en cours ici : un jeu resté pris (fin de rendu manquée) est libre
             }
             foreach (Camera camera in _deadCameras)
             {
-                _cameraResources[camera].Release();
-                _cameraResources.Remove(camera);
+                CameraState state = _cameras[camera];
+                ReturnBuffers(state);
+                state.args?.Release();
+                _cameras.Remove(camera);
             }
             _deadCameras.Clear();
         }
 
         void OnCameraPreCull(Camera camera) => RenderForCamera(camera);
 
+        void OnCameraPostRender(Camera camera) => EndCamera(camera);
+
         void OnBeginCameraRendering(ScriptableRenderContext context, Camera camera) => RenderForCamera(camera);
+
+        void OnEndCameraRendering(ScriptableRenderContext context, Camera camera) => EndCamera(camera);
+
+        void EndCamera(Camera camera)
+        {
+            if (_cameras.TryGetValue(camera, out CameraState state))
+                ReturnBuffers(state);
+        }
 
         MeshSpawnerBehavior FindBehavior()
         {
@@ -407,6 +479,7 @@ namespace Nyx.GpuInstancing
             ComputeShader cs = _cullingShader;
             uint multiplier = GetInstanceMultiplier(camera);
             bool stereo = SetCameraParameters(cs, camera, multiplier, out Vector3 shadowSweep);
+            CameraState state = GetCameraState(camera);
 
             // Spawner entièrement hors du frustum ou trop loin : ni dispatch, ni draw.
             Bounds cullBounds = _worldBounds;
@@ -414,14 +487,13 @@ namespace Nyx.GpuInstancing
             cullBounds.extents += Abs(shadowSweep);
             if (!BoundsVisible(cullBounds, stereo, camera.transform.position))
             {
-                if (_cameraResources.TryGetValue(camera, out CameraResources skipped))
-                    skipped.skippedLastRender = true;
+                state.skippedLastRender = true;
                 return;
             }
 
-            CameraResources resources = GetCameraResources(camera);
-            resources.lastMultiplier = multiplier;
-            resources.skippedLastRender = false;
+            CullingBuffers buffers = state.inUse ??= TakeBuffers();
+            state.lastMultiplier = multiplier;
+            state.skippedLastRender = false;
 
             cs.SetFloat(ShaderIds.Time, CurrentTime);
             cs.SetInt(ShaderIds.InstanceCount, InstanceCount);
@@ -431,10 +503,11 @@ namespace Nyx.GpuInstancing
             cs.SetBuffer(_kernelCull, ShaderIds.Instances, _instanceBuffer);
             cs.SetBuffer(_kernelCull, ShaderIds.Variants, _variantBuffer);
             cs.SetBuffer(_kernelCull, ShaderIds.BucketOffsets, _bucketOffsetBuffer);
-            cs.SetBuffer(_kernelCull, ShaderIds.Visible, resources.visible);
-            cs.SetBuffer(_kernelCull, ShaderIds.Counters, resources.counters);
-            cs.SetBuffer(_kernelWriteArgs, ShaderIds.Counters, resources.counters);
-            cs.SetBuffer(_kernelWriteArgs, ShaderIds.Args, resources.args);
+            cs.SetBuffer(_kernelCull, ShaderIds.Visible, buffers.visible);
+            cs.SetBuffer(_kernelCull, ShaderIds.VisibleIndex, buffers.visibleIndex);
+            cs.SetBuffer(_kernelCull, ShaderIds.Counters, buffers.counters);
+            cs.SetBuffer(_kernelWriteArgs, ShaderIds.Counters, buffers.counters);
+            cs.SetBuffer(_kernelWriteArgs, ShaderIds.Args, state.args);
 
             int groups = (InstanceCount + ThreadGroupSize - 1) / ThreadGroupSize;
             int groupsX = Mathf.Min(groups, MaxGroupsPerDimension);
@@ -452,20 +525,20 @@ namespace Nyx.GpuInstancing
             {
                 Graphics.DrawMeshInstancedIndirect(
                     _bucketMeshes[b], _bucketSubMeshes[b], _bucketMaterials[b], _worldBounds,
-                    resources.args, b * ArgsPerDraw * sizeof(uint), resources.blocks[b],
+                    state.args, b * ArgsPerDraw * sizeof(uint), buffers.blocks[b],
                     mainShadows, receiveShadows, renderLayer, camera, LightProbeUsage.Off);
 
                 if (splitShadows)
                 {
                     Graphics.DrawMeshInstancedIndirect(
                         _bucketMeshes[b], _bucketSubMeshes[b], _bucketMaterials[b], _worldBounds,
-                        resources.args, (_bucketCount + b) * ArgsPerDraw * sizeof(uint), resources.blocks[b],
+                        state.args, (_bucketCount + b) * ArgsPerDraw * sizeof(uint), buffers.blocks[b],
                         ShadowCastingMode.ShadowsOnly, false, renderLayer, camera, LightProbeUsage.Off);
                 }
             }
 
             if (logVisibleCounts)
-                LogVisibleCounts(camera, resources, multiplier);
+                LogVisibleCounts(camera, state, multiplier);
         }
 
         bool ShouldRenderFor(Camera camera)
@@ -485,30 +558,49 @@ namespace Nyx.GpuInstancing
             }
         }
 
-        CameraResources GetCameraResources(Camera camera)
+        CameraState GetCameraState(Camera camera)
         {
-            if (_cameraResources.TryGetValue(camera, out CameraResources resources))
-                return resources;
+            if (_cameras.TryGetValue(camera, out CameraState state))
+                return state;
+            state = new CameraState { args = new ComputeBuffer(_argsTemplate.Length, sizeof(uint), ComputeBufferType.IndirectArguments) };
+            state.args.SetData(_argsTemplate);
+            _cameras.Add(camera, state);
+            return state;
+        }
+
+        /// <summary>Jeu de buffers libre, ou un nouveau si toutes les caméras en cours de rendu en tiennent un.</summary>
+        CullingBuffers TakeBuffers()
+        {
+            if (_freeBuffers.Count > 0)
+                return _freeBuffers.Pop();
 
             // Création seulement (jamais de libération ici : on peut être au milieu du rendu d'une autre caméra)
-            resources = new CameraResources
+            var buffers = new CullingBuffers
             {
-                visible = new ComputeBuffer(Mathf.Max(_visibleSlots, 1), GpuInstanceData.Stride, ComputeBufferType.Default),
-                counters = new ComputeBuffer(Mathf.Max(_bucketCount, 1), sizeof(uint), ComputeBufferType.Default),
-                args = new ComputeBuffer(_argsTemplate.Length, sizeof(uint), ComputeBufferType.IndirectArguments),
+                visible = new ComputeBuffer(Mathf.Max(_visibleCapacity, 1), GpuInstanceData.Stride, ComputeBufferType.Default),
+                visibleIndex = new ComputeBuffer(Mathf.Max(_indexCapacity, 1), sizeof(uint), ComputeBufferType.Default),
+                counters = new ComputeBuffer(_bucketCount + 1, sizeof(uint), ComputeBufferType.Default),
                 blocks = new MaterialPropertyBlock[_bucketCount]
             };
-            resources.counters.SetData(new uint[Mathf.Max(_bucketCount, 1)]);
-            resources.args.SetData(_argsTemplate);
+            buffers.counters.SetData(new uint[_bucketCount + 1]);
             for (int b = 0; b < _bucketCount; b++)
             {
                 var block = new MaterialPropertyBlock();
-                block.SetBuffer(ShaderIds.RenderData, resources.visible);
+                block.SetBuffer(ShaderIds.RenderData, buffers.visible);
+                block.SetBuffer(ShaderIds.RenderIndex, buffers.visibleIndex);
                 block.SetFloat(ShaderIds.BucketOffset, _bucketOffsets[b]);
-                resources.blocks[b] = block;
+                buffers.blocks[b] = block;
             }
-            _cameraResources.Add(camera, resources);
-            return resources;
+            _allBuffers.Add(buffers);
+            return buffers;
+        }
+
+        void ReturnBuffers(CameraState state)
+        {
+            if (state.inUse == null)
+                return;
+            _freeBuffers.Push(state.inUse);
+            state.inUse = null;
         }
 
         /// <summary>Plans du frustum (2 yeux en stéréo), distance, taille mini, extrusion d'ombre, multiplicateur VR.</summary>
@@ -629,8 +721,7 @@ namespace Nyx.GpuInstancing
 
         void Rebuild()
         {
-            _dirty = false;
-            ReleaseAll();
+            ReleaseRenderResources();
             _dirty = false;
 
             MeshSpawnerBehavior behavior = FindBehavior();
@@ -640,6 +731,8 @@ namespace Nyx.GpuInstancing
                     Debug.LogWarning($"{name} : aucun comportement (MeshSpawnerBehavior) sur l'objet, rien n'est dessiné. " +
                                      "Ajouter par exemple Static Instances, Float On Waves ou Bubble Columns.", this);
                 _warnedNoBehavior = true;
+                DisposePlacements();
+                ReleaseInstanceBuffer();
                 return;
             }
             _warnedNoBehavior = false;
@@ -653,12 +746,6 @@ namespace Nyx.GpuInstancing
             _kernelWriteArgs = _cullingShader.FindKernel("NyxWriteArgs");
 
             int variantCount = variants.Count;
-            _buildList.Clear();
-            _buildBounds = behavior.UsesPlacement ? BuildFromPlacements(behavior, _buildList) : behavior.BuildInstances(_buildList);
-            UpdateWorldBounds();
-
-            // 1. Instances par variante. Une variante invalide (mesh/matériau manquant) pointe vers une
-            //    variante "désactivée" : les index restent stables pour les mises à jour partielles.
             var lodCounts = new int[variantCount];
             for (int v = 0; v < variantCount; v++)
             {
@@ -669,33 +756,84 @@ namespace Nyx.GpuInstancing
                     Debug.LogWarning($"{name} : cochez « Enable GPU Instancing » sur le matériau '{variants[v].material.name}', sinon rien ne s'affichera dans les builds.", this);
             }
 
-            var perVariant = new int[variantCount];
-            for (int i = 0; i < _buildList.Count; i++)
+            // 1. Instances, construites en mémoire native (jobs Burst) et libérées dès l'envoi au GPU
+            NativeArray<GpuInstanceData> instances = default;
+            var perVariant = new NativeArray<int>(variantCount, Allocator.TempJob);
+            var validVariants = new NativeArray<int>(variantCount, Allocator.TempJob);
+            try
             {
-                GpuInstanceData data = _buildList[i];
-                int v = data.Variant;
-                if (v >= 0 && v < variantCount && lodCounts[v] > 0)
+                if (behavior.UsesPlacement)
                 {
-                    perVariant[v]++;
+                    GeneratePlacements();
+                    instances = new NativeArray<GpuInstanceData>(_placements.Length, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+                    _buildBounds = new Bounds(transform.position, Vector3.one);
+                    if (_placements.Length > 0)
+                    {
+                        behavior.CreateInstances(_placements, instances);
+                        _buildBounds = behavior.GetPlacementBounds(PlacementBounds(out float maxScale), (MaxVariantRadius() + boundsPadding) * maxScale);
+                    }
                 }
                 else
                 {
-                    data.Variant = variantCount;   // index de la variante désactivée
-                    _buildList[i] = data;
+                    DisposePlacements();
+                    instances = new NativeArray<GpuInstanceData>(Mathf.Max(0, behavior.GetInstanceCount()), Allocator.TempJob);
+                    _buildBounds = behavior.BuildInstances(instances);
                 }
-            }
+                UpdateWorldBounds();
 
+                // 2. Instances par variante ; une variante invalide (mesh/matériau manquant) pointe vers une variante
+                //    "désactivée" : les index restent stables pour les mises à jour partielles.
+                for (int v = 0; v < variantCount; v++)
+                    validVariants[v] = lodCounts[v] > 0 ? 1 : 0;
+                new MeshSpawnerJobs.CountVariantsJob
+                {
+                    instances = instances,
+                    validVariants = validVariants,
+                    perVariant = perVariant,
+                    disabledVariant = variantCount
+                }.Run();
+
+                if (!BuildBuckets(behavior, lodCounts, perVariant))
+                    return;
+
+                // 3. Envoi au GPU (buffer réutilisé si le nombre d'instances n'a pas changé)
+                int instanceCount = instances.Length;
+                if (_instanceBuffer == null || !_instanceBuffer.IsValid() || _instanceBuffer.count != Mathf.Max(instanceCount, 1))
+                {
+                    ReleaseInstanceBuffer();
+                    _instanceBuffer = new ComputeBuffer(Mathf.Max(instanceCount, 1), GpuInstanceData.Stride, ComputeBufferType.Default);
+                }
+                if (instanceCount > 0)
+                    _instanceBuffer.SetData(instances);
+                InstanceCount = instanceCount;
+                _built = true;
+            }
+            finally
+            {
+                if (instances.IsCreated)
+                    instances.Dispose();
+                perVariant.Dispose();
+                validVariants.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Un "bucket" = un draw = (variante, LOD). Chaque draw a sa zone d'index (4 octets par instance), dimensionnée pour
+        /// le pire cas (toutes les instances de la variante dans ce LOD) ; les données de rendu (64 octets) ne sont écrites
+        /// qu'une fois par instance visible, toutes variantes confondues.
+        /// </summary>
+        bool BuildBuckets(MeshSpawnerBehavior behavior, int[] lodCounts, NativeArray<int> perVariant)
+        {
+            int variantCount = lodCounts.Length;
             int bucketCount = 0;
             for (int v = 0; v < variantCount; v++)
                 bucketCount += lodCounts[v];
             if (bucketCount > MaxBuckets)
             {
                 Debug.LogError($"{name} : {bucketCount} draws (variantes × LODs) > {MaxBuckets}. Réduisez les variantes ou les LODs.", this);
-                return;
+                return false;
             }
 
-            // 2. Un "bucket" = un draw = (variante, LOD). Chaque bucket a sa zone dans le buffer des visibles,
-            //    dimensionnée pour le pire cas (toutes les instances de la variante dans ce LOD).
             _bucketMeshes = new Mesh[bucketCount];
             _bucketMaterials = new Material[bucketCount];
             _bucketSubMeshes = new int[bucketCount];
@@ -704,7 +842,8 @@ namespace Nyx.GpuInstancing
             _argsTemplate = new uint[Mathf.Max(bucketCount, 1) * ArgsPerDraw * 2];   // bloc caméra + bloc ombre
             var variantInfos = new GpuVariantInfo[variantCount + 1];
             int bucket = 0;
-            uint visibleSlots = 0;
+            uint indexSlots = 0;
+            int validInstances = 0;
 
             for (int v = 0; v < variantCount; v++)
             {
@@ -716,6 +855,7 @@ namespace Nyx.GpuInstancing
 
                 InstanceVariant variant = variants[v];
                 int lods = lodCounts[v];
+                validInstances += perVariant[v];
                 Bounds local = LocalBounds(variant, lods);
                 float padding = behavior.GetBoundsPadding(variant, local, boundsPadding);
                 float cull = variant.cullDistance > 0f ? variant.cullDistance * variant.cullDistance : float.MaxValue;
@@ -736,8 +876,8 @@ namespace Nyx.GpuInstancing
                     _bucketMaterials[bucket] = variant.material;
                     _bucketSubMeshes[bucket] = subMesh;
                     _bucketLabels[bucket] = $"v{v}/LOD{lod}";
-                    _bucketOffsets[bucket] = visibleSlots;
-                    visibleSlots += (uint)perVariant[v];
+                    _bucketOffsets[bucket] = indexSlots;
+                    indexSlots += (uint)perVariant[v];
 
                     for (int block = 0; block < 2; block++)
                     {
@@ -752,52 +892,95 @@ namespace Nyx.GpuInstancing
             }
             variantInfos[variantCount] = GpuVariantInfo.Disabled;
 
-            // 3. Buffers communs. Les buffers par caméra sont créés au premier rendu de chaque caméra.
-            int instanceCount = _buildList.Count;
-            _instances = _buildList.ToArray();
-            _instanceBuffer = new ComputeBuffer(Mathf.Max(instanceCount, 1), GpuInstanceData.Stride, ComputeBufferType.Default);
             _variantBuffer = new ComputeBuffer(variantInfos.Length, GpuVariantInfo.Stride, ComputeBufferType.Default);
             _bucketOffsetBuffer = new ComputeBuffer(_bucketOffsets.Length, sizeof(uint), ComputeBufferType.Default);
-            if (instanceCount > 0)
-                _instanceBuffer.SetData(_instances, 0, 0, instanceCount);
             _variantBuffer.SetData(variantInfos);
             _bucketOffsetBuffer.SetData(_bucketOffsets);
-
-            _visibleSlots = (int)visibleSlots;
+            _visibleCapacity = validInstances;
+            _indexCapacity = (int)indexSlots;
             _bucketCount = bucketCount;
-            InstanceCount = instanceCount;
-            _built = true;
+            return true;
         }
 
-        /// <summary>Instances à partir du placement (généré ou liste), traduites par le comportement ; renvoie les bounds monde.</summary>
-        Bounds BuildFromPlacements(MeshSpawnerBehavior behavior, List<GpuInstanceData> output)
+        /// <summary>Placements en mémoire native : générés par un job Burst, ou recopiés de la liste sérialisée.</summary>
+        void GeneratePlacements()
         {
-            IReadOnlyList<MeshPlacement> list = placements;
-            if (source == PlacementSource.Procedural)
-            {
-                GeneratePlacements(_generated);
-                list = _generated;
-            }
-            if (list.Count == 0)
-                return new Bounds(transform.position, Vector3.one);
-
+            DisposePlacements();
             int variantCount = Mathf.Max(variants.Count, 1);
-            var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-            var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-            float maxScale = 0f;
-            for (int i = 0; i < list.Count; i++)
+            Vector3 center = transform.position;
+
+            _anchorPositions.Clear();
+            foreach (Transform anchor in clusterAnchors)
+                _anchorPositions.Add(anchor != null ? anchor.position : Vector3.zero);
+
+            if (source == PlacementSource.List)
             {
-                MeshPlacement placement = list[i];
-                placement.variant = Mathf.Clamp(placement.variant, 0, variantCount - 1);
-                output.Add(behavior.CreateInstance(placement));
-                min = Vector3.Min(min, placement.position);
-                max = Vector3.Max(max, placement.position);
-                maxScale = Mathf.Max(maxScale, Mathf.Abs(placement.scale));
+                _placements = new NativeArray<MeshPlacement>(placements.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                for (int i = 0; i < placements.Count; i++)
+                {
+                    MeshPlacement placement = placements[i];
+                    placement.variant = Mathf.Clamp(placement.variant, 0, variantCount - 1);
+                    _placements[i] = placement;
+                }
+                return;
             }
 
-            var positions = new Bounds();
-            positions.SetMinMax(min, max);
-            return behavior.GetPlacementBounds(positions, (MaxVariantRadius() + boundsPadding) * maxScale);
+            int cellsX = 0, cellsZ = 0;
+            float stepX = 0f, stepZ = 0f;
+            if (densityPer100m2 > 0f && areaSize.x > 0f && areaSize.y > 0f)
+            {
+                float cell = Mathf.Sqrt(100f / densityPer100m2);
+                cellsX = Mathf.Max(1, Mathf.RoundToInt(areaSize.x / cell));
+                cellsZ = Mathf.Max(1, Mathf.RoundToInt(areaSize.y / cell));
+                if ((long)cellsX * cellsZ > MaxGeneratedInstances)
+                {
+                    Debug.LogWarning($"{name} : {(long)cellsX * cellsZ} instances demandées, limité à {MaxGeneratedInstances}.", this);
+                    float reduction = Mathf.Sqrt((float)MaxGeneratedInstances / ((long)cellsX * cellsZ));
+                    cellsX = Mathf.Max(1, (int)(cellsX * reduction));
+                    cellsZ = Mathf.Max(1, (int)(cellsZ * reduction));
+                }
+                stepX = areaSize.x / cellsX;
+                stepZ = areaSize.y / cellsZ;
+            }
+
+            var anchors = new NativeArray<float3>(clusterAnchors.Count, Allocator.TempJob);
+            int anchorCount = 0;
+            foreach (Transform anchor in clusterAnchors)
+            {
+                if (anchor != null)
+                    anchors[anchorCount++] = anchor.position;
+            }
+            int gridCount = cellsX * cellsZ;
+            int total = gridCount + anchorCount * clumpsPerCluster;
+            _placements = new NativeArray<MeshPlacement>(total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            new MeshSpawnerJobs.GeneratePlacementsJob
+            {
+                output = _placements,
+                anchors = anchors,
+                seed = (uint)randomSeed,
+                cellsX = Mathf.Max(cellsX, 1),
+                gridCount = gridCount,
+                origin = new float2(center.x - areaSize.x * 0.5f, center.z - areaSize.y * 0.5f),
+                step = new float2(stepX, stepZ),
+                height = center.y,
+                clumpsPerCluster = Mathf.Max(clumpsPerCluster, 1),
+                clusterRadius = clusterRadius,
+                scaleRange = new float2(scaleRange.x, scaleRange.y),
+                variantCount = variantCount
+            }.Schedule(total, MeshSpawnerJobs.BatchSize).Complete();
+            anchors.Dispose();
+        }
+
+        /// <summary>Boîte des positions au repos des placements (job Burst) et plus grande échelle.</summary>
+        Bounds PlacementBounds(out float maxScale)
+        {
+            var result = new NativeArray<float4>(2, Allocator.TempJob);
+            new MeshSpawnerJobs.PlacementBoundsJob { placements = _placements, result = result }.Run();
+            var bounds = new Bounds();
+            bounds.SetMinMax(result[0].xyz, result[1].xyz);
+            maxScale = result[1].w;
+            result.Dispose();
+            return bounds;
         }
 
         /// <summary>Plus grand rayon des meshes (depuis leur pivot), toutes variantes et LODs confondus.</summary>
@@ -816,72 +999,6 @@ namespace Nyx.GpuInstancing
             }
             return radius;
         }
-
-        void GeneratePlacements(List<MeshPlacement> output)
-        {
-            output.Clear();
-            var random = new System.Random(randomSeed);
-            int variantCount = Mathf.Max(variants.Count, 1);
-            Vector3 center = transform.position;
-
-            // Grille perturbée : 1 instance par cellule, position aléatoire dans la cellule. O(n), sans amas ni trous.
-            if (densityPer100m2 > 0f && areaSize.x > 0f && areaSize.y > 0f)
-            {
-                float cell = Mathf.Sqrt(100f / densityPer100m2);
-                int cellsX = Mathf.Max(1, Mathf.RoundToInt(areaSize.x / cell));
-                int cellsZ = Mathf.Max(1, Mathf.RoundToInt(areaSize.y / cell));
-                if ((long)cellsX * cellsZ > MaxGeneratedInstances)
-                {
-                    Debug.LogWarning($"{name} : {(long)cellsX * cellsZ} instances demandées, limité à {MaxGeneratedInstances}.", this);
-                    float reduction = Mathf.Sqrt((float)MaxGeneratedInstances / ((long)cellsX * cellsZ));
-                    cellsX = Mathf.Max(1, (int)(cellsX * reduction));
-                    cellsZ = Mathf.Max(1, (int)(cellsZ * reduction));
-                }
-
-                float stepX = areaSize.x / cellsX;
-                float stepZ = areaSize.y / cellsZ;
-                float x0 = center.x - areaSize.x * 0.5f;
-                float z0 = center.z - areaSize.y * 0.5f;
-                for (int z = 0; z < cellsZ; z++)
-                {
-                    for (int x = 0; x < cellsX; x++)
-                    {
-                        var position = new Vector3(x0 + (x + Next(random)) * stepX, center.y, z0 + (z + Next(random)) * stepZ);
-                        output.Add(RandomPlacement(random, position, variantCount));
-                    }
-                }
-            }
-
-            // Amas autour des ancres, répartition uniforme sur le disque
-            _anchorPositions.Clear();
-            foreach (Transform anchor in clusterAnchors)
-            {
-                _anchorPositions.Add(anchor != null ? anchor.position : Vector3.zero);
-                if (anchor == null)
-                    continue;
-                for (int i = 0; i < clumpsPerCluster; i++)
-                {
-                    float angle = Next(random) * Mathf.PI * 2f;
-                    float distance = clusterRadius * Mathf.Sqrt(Next(random));
-                    var position = new Vector3(anchor.position.x + Mathf.Cos(angle) * distance, center.y, anchor.position.z + Mathf.Sin(angle) * distance);
-                    output.Add(RandomPlacement(random, position, variantCount));
-                }
-            }
-        }
-
-        MeshPlacement RandomPlacement(System.Random random, Vector3 position, int variantCount)
-        {
-            return new MeshPlacement
-            {
-                position = position,
-                yaw = Next(random) * 360f,
-                scale = Mathf.Lerp(scaleRange.x, scaleRange.y, Next(random)),
-                variant = random.Next(variantCount),
-                seed = Next(random)
-            };
-        }
-
-        static float Next(System.Random random) => (float)random.NextDouble();
 
         static int LodCount(InstanceVariant variant)
         {
@@ -914,26 +1031,43 @@ namespace Nyx.GpuInstancing
 
         static long Size(ComputeBuffer buffer) => buffer != null && buffer.IsValid() ? (long)buffer.count * buffer.stride : 0L;
 
-        void ReleaseAll()
+        /// <summary>Buffers liés aux draws et aux caméras (le buffer d'instances est gardé pour être réutilisé).</summary>
+        void ReleaseRenderResources()
         {
-            _instanceBuffer?.Release();
             _variantBuffer?.Release();
             _bucketOffsetBuffer?.Release();
-            _instanceBuffer = _variantBuffer = _bucketOffsetBuffer = null;
-            foreach (CameraResources resources in _cameraResources.Values)
-                resources.Release();
-            _cameraResources.Clear();
+            _variantBuffer = _bucketOffsetBuffer = null;
+            foreach (CullingBuffers buffers in _allBuffers)
+                buffers.Release();
+            _allBuffers.Clear();
+            _freeBuffers.Clear();
+            foreach (CameraState state in _cameras.Values)
+                state.args?.Release();
+            _cameras.Clear();
             _bucketCount = 0;
             InstanceCount = 0;
             _built = false;
             _dirty = true;
         }
 
+        void ReleaseInstanceBuffer()
+        {
+            _instanceBuffer?.Release();
+            _instanceBuffer = null;
+        }
+
+        void DisposePlacements()
+        {
+            if (_placements.IsCreated)
+                _placements.Dispose();
+            _placements = default;
+        }
+
         // ------------------------------------------------------------------------------------------
         // Diagnostic
         // ------------------------------------------------------------------------------------------
 
-        void LogVisibleCounts(Camera camera, CameraResources resources, uint multiplier)
+        void LogVisibleCounts(Camera camera, CameraState state, uint multiplier)
         {
             if (!SystemInfo.supportsAsyncGPUReadback || camera.cameraType == CameraType.SceneView)
                 return;
@@ -948,7 +1082,7 @@ namespace Nyx.GpuInstancing
             long memory = GpuMemoryBytes;
             string cameraName = camera.name;
 
-            AsyncGPUReadback.Request(resources.args, request =>
+            AsyncGPUReadback.Request(state.args, request =>
             {
                 if (request.hasError || this == null)
                     return;
@@ -974,6 +1108,7 @@ namespace Nyx.GpuInstancing
             public static readonly int Variants = Shader.PropertyToID("_NyxVariants");
             public static readonly int BucketOffsets = Shader.PropertyToID("_NyxBucketOffsets");
             public static readonly int Visible = Shader.PropertyToID("_NyxVisible");
+            public static readonly int VisibleIndex = Shader.PropertyToID("_NyxVisibleIndex");
             public static readonly int Counters = Shader.PropertyToID("_NyxCounters");
             public static readonly int Args = Shader.PropertyToID("_NyxArgs");
             public static readonly int InstanceCount = Shader.PropertyToID("_NyxInstanceCount");
@@ -987,6 +1122,7 @@ namespace Nyx.GpuInstancing
             public static readonly int ShadowSweep = Shader.PropertyToID("_NyxShadowSweep");
             public static readonly int Time = Shader.PropertyToID("_NyxTime");
             public static readonly int RenderData = Shader.PropertyToID("_NyxRenderData");
+            public static readonly int RenderIndex = Shader.PropertyToID("_NyxRenderIndex");
             public static readonly int BucketOffset = Shader.PropertyToID("_NyxBucketOffset");
         }
     }
