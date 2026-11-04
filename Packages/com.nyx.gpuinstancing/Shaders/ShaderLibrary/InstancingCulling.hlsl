@@ -15,8 +15,8 @@
 
 #include "InstancingData.hlsl"
 
-#define NYX_THREADS 64        // = InstancedFieldBase.ThreadGroupSize
-#define NYX_MAX_BUCKETS 64    // = InstancedFieldBase.MaxBuckets
+#define NYX_THREADS 64        // = MeshSpawner.ThreadGroupSize
+#define NYX_MAX_BUCKETS 64    // = MeshSpawner.MaxBuckets
 
 StructuredBuffer<NyxInstanceData>  _NyxInstances;
 StructuredBuffer<NyxVariantInfo>   _NyxVariants;

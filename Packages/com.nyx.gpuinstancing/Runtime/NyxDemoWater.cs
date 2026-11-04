@@ -1,16 +1,19 @@
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Nyx.GpuInstancing
 {
     /// <summary>
-    /// Surface d'eau de démonstration : grille générée au chargement (aucun asset), déformée dans le shader
-    /// « Nyx/GPU Instancing/Demo Water » par la même houle que les sargasses. Objet posé au niveau de l'eau.
+    /// Surface d'eau de démonstration : grille générée au chargement (aucun asset, rien de sérialisé), dessinée pour chaque
+    /// caméra et déformée dans le shader « Nyx/GPU Instancing/Demo Water » par la même houle que FloatOnWaves.
+    /// Objet posé au niveau de l'eau.
     /// </summary>
     [ExecuteAlways]
-    [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
     [AddComponentMenu("Nyx/GPU Instancing/Demo Water")]
     public sealed class NyxDemoWater : MonoBehaviour
     {
+        [Tooltip("Matériau utilisant le shader Nyx/GPU Instancing/Demo Water.")]
+        [SerializeField] Material material;
         [Tooltip("Côté de la surface (m).")]
         [SerializeField, Min(1f)] float size = 160f;
         [Tooltip("Cases par côté : plus fin = vagues plus lisses, plus de sommets.")]
@@ -18,7 +21,24 @@ namespace Nyx.GpuInstancing
 
         Mesh _mesh;
 
-        void OnEnable() => Build();
+        public Material Material
+        {
+            get => material;
+            set => material = value;
+        }
+
+        void OnEnable()
+        {
+            Build();
+            Camera.onPreCull += Draw;
+            RenderPipelineManager.beginCameraRendering += DrawSrp;
+        }
+
+        void OnDisable()
+        {
+            Camera.onPreCull -= Draw;
+            RenderPipelineManager.beginCameraRendering -= DrawSrp;
+        }
 
         void OnValidate()
         {
@@ -34,6 +54,15 @@ namespace Nyx.GpuInstancing
                 Destroy(_mesh);
             else
                 DestroyImmediate(_mesh);
+        }
+
+        void DrawSrp(ScriptableRenderContext context, Camera camera) => Draw(camera);
+
+        void Draw(Camera camera)
+        {
+            if (material == null || _mesh == null || camera.cameraType == CameraType.Preview || camera.cameraType == CameraType.Reflection)
+                return;
+            Graphics.DrawMesh(_mesh, transform.localToWorldMatrix, material, gameObject.layer, camera, 0, null, ShadowCastingMode.Off, false);
         }
 
         void Build()
@@ -71,14 +100,13 @@ namespace Nyx.GpuInstancing
                 }
             }
             _mesh.Clear();
-            _mesh.indexFormat = vertices.Length > 65535 ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
+            _mesh.indexFormat = vertices.Length > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
             _mesh.vertices = vertices;
             _mesh.normals = normals;
             _mesh.uv = uvs;
             _mesh.triangles = triangles;
             // Bounds agrandies : les vagues déplacent les sommets dans le shader
             _mesh.bounds = new Bounds(Vector3.zero, new Vector3(size + 8f, 8f, size + 8f));
-            GetComponent<MeshFilter>().sharedMesh = _mesh;
         }
     }
 }

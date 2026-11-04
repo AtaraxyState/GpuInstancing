@@ -60,7 +60,7 @@ namespace Nyx.GpuInstancing
         public static float WaterLevel => s_WaterLevel;
 
         /// <summary>Temps des vagues, calculé à la demande : CPU et GPU voient la même valeur dans une frame, quel que soit l'ordre des scripts.</summary>
-        public static float WaveTime => InstancedFieldBase.CurrentTime * (Active != null ? Active.timeScale : 1f);
+        public static float WaveTime => MeshSpawner.CurrentTime * (Active != null ? Active.timeScale : 1f);
 
         /// <summary>Somme des amplitudes : déplacement horizontal / vertical maximal possible (m).</summary>
         public static float MaxHorizontalDisplacement => s_MaxHorizontal;

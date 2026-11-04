@@ -1,4 +1,4 @@
-// Culling GPU + simulation analytique des bulles (utilisé par BubbleField.cs).
+// Culling GPU + simulation analytique des bulles (comportement BubbleColumns.cs).
 // Aucune donnée n'est renvoyée par le CPU à chaque frame : la position est une fonction du temps.
 #pragma kernel NyxCull
 #pragma kernel NyxWriteArgs
@@ -10,7 +10,7 @@ float  _NyxTime;
 float4 _BubbleShape;   // x : aplatissement max, y : rayon (m) d'aplatissement max, z : vitesse d'oscillation (rad/s), w : distance d'éclatement (m)
 float4 _BubbleTiming;  // x : durée d'apparition (s)
 
-// Disposition écrite par BubbleField.cs :
+// Disposition écrite par BubbleColumns.cs :
 //   row0 : xyz = point d'émission (monde), w = instant d'émission (s)
 //   row1 : x = rayon en surface (m), y = vitesse de montée (m/s), z = durée de vie ou période (s), w = 1 boucle / 0 ponctuelle
 //   row2 : x = rayon de la spirale (m), y = tours par seconde, z = graine 0..1

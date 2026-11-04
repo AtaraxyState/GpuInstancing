@@ -1,0 +1,20 @@
+// Comportement « Static Instances » (StaticInstances.cs) : instances immobiles.
+// Modèle à copier pour écrire un comportement : NyxEvaluateInstance reçoit la donnée écrite par le C#
+// (MeshSpawnerBehavior.CreateInstance : matrice 3x4 + graine) et renvoie la matrice finale de l'instance.
+#pragma kernel NyxCull
+#pragma kernel NyxWriteArgs
+
+#include "../../ShaderLibrary/InstancingData.hlsl"
+
+// Paramètres disponibles si besoin : float _NyxTime (s), et ceux posés par SetShaderParameters côté C#.
+
+bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)
+{
+    dst.row0 = src.row0;
+    dst.row1 = src.row1;
+    dst.row2 = src.row2;
+    dst.custom = src.custom;   // x : graine (variation de teinte dans le shader Lit), w : variante
+    return true;               // false = instance ignorée (morte, cachée)
+}
+
+#include "../../ShaderLibrary/InstancingCulling.hlsl"

@@ -3,13 +3,13 @@ using UnityEngine;
 namespace Nyx.GpuInstancing
 {
     /// <summary>
-    /// Exemple d'utilisation de BubbleField.Emit : expirations périodiques depuis un point mobile
+    /// Exemple d'utilisation de BubbleColumns.Emit : expirations périodiques depuis un point mobile
     /// (détendeur d'un plongeur, échappement d'un drone sous-marin...). À poser sur l'objet émetteur.
     /// </summary>
     [AddComponentMenu("Nyx/GPU Instancing/Bubble Burst Emitter")]
     public sealed class BubbleBurstEmitter : MonoBehaviour
     {
-        [SerializeField] BubbleField field;
+        [SerializeField] BubbleColumns field;
         [Tooltip("Secondes entre deux expirations (un plongeur : environ 4 à 5 s).")]
         [SerializeField, Min(0.05f)] float interval = 4.5f;
         [Tooltip("Variation aléatoire de l'intervalle (s).")]

@@ -12,8 +12,11 @@ using UnityEngine.SceneManagement;
 ///  - resolve.request : relit Packages/ (enregistre un package ajouté ou modifié) ;
 ///  - refresh.request : réimporte les fichiers modifiés (recompilation) ;
 ///  - run.request     : test de fumée du package ;
-///  - demo.request    : reconstruit la scène de démo (Assets/NyxGpuInstancingDemo/NyxGpuInstancingDemo.unity).
-/// Le test et la démo ne sont pas lancés si une scène ouverte a des modifications non enregistrées.
+///  - demo.request    : reconstruit la scène de démo (Assets/NyxGpuInstancingDemo/NyxGpuInstancingDemo.unity) ;
+///  - state.request   : écrit dans state.txt les scènes ouvertes et si elles ont des modifications non enregistrées ;
+///  - invoke.request  : appelle la méthode statique « Type, Assembly|Méthode » écrite dans le fichier, résultat dans invoke.txt.
+/// Le test et la démo ne sont pas lancés si une scène ouverte a des modifications non enregistrées (sauf la scène de démo,
+/// qui est reconstruite).
 /// </summary>
 [InitializeOnLoad]
 static class NyxGpuInstancingDevTrigger
@@ -44,6 +47,40 @@ static class NyxGpuInstancingDevTrigger
             AssetDatabase.Refresh();
             return;
         }
+        string invoke = Path.Combine(folder, "invoke.request");
+        if (File.Exists(invoke))
+        {
+            // Contenu : « Type, Assembly|Méthode » (méthode statique sans paramètre)
+            string[] target = File.ReadAllText(invoke).Trim().Split('|');
+            File.Delete(invoke);
+            Type type = Type.GetType(target[0]);
+            MethodInfo method = target.Length > 1 ? type?.GetMethod(target[1].Trim(), BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static) : null;
+            string result;
+            try
+            {
+                if (method == null)
+                    throw new MissingMethodException(string.Join("|", target));
+                method.Invoke(null, null);
+                result = "ok";
+            }
+            catch (Exception exception)
+            {
+                result = "exception " + exception;
+            }
+            File.WriteAllText(Path.Combine(folder, "invoke.txt"), result);
+            return;
+        }
+        if (Take(folder, "state.request"))
+        {
+            var state = new System.Text.StringBuilder();
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene open = SceneManager.GetSceneAt(i);
+                state.AppendLine($"{open.path} dirty={open.isDirty}");
+            }
+            File.WriteAllText(Path.Combine(folder, "state.txt"), state.ToString());
+            return;
+        }
         bool run = File.Exists(Path.Combine(folder, "run.request"));
         bool demo = File.Exists(Path.Combine(folder, "demo.request"));
         if (!run && !demo)
@@ -53,9 +90,10 @@ static class NyxGpuInstancingDevTrigger
         for (int i = 0; i < SceneManager.sceneCount; i++)
         {
             Scene scene = SceneManager.GetSceneAt(i);
-            // Scène dont le fichier a été supprimé (ex. démo d'un outil retiré) : rien à préserver
+            // Rien à préserver : scène dont le fichier a été supprimé, ou scène de démo (reconstruite par demo.request)
             bool fileDeleted = !string.IsNullOrEmpty(scene.path) && !File.Exists(Path.Combine(Application.dataPath, "..", scene.path));
-            if (scene.isDirty && !fileDeleted)
+            bool generatedDemo = scene.path == DemoScenePath;
+            if (scene.isDirty && !fileDeleted && !generatedDemo)
             {
                 File.WriteAllText(Path.Combine(folder, "status.txt"),
                     "blocked : une scène ouverte a des modifications non enregistrées (enregistrer ou annuler dans Unity, puis relancer)");

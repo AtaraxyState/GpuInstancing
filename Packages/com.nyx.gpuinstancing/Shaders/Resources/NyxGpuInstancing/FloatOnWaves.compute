@@ -1,4 +1,4 @@
-// Culling GPU + flottaison des sargasses (utilisé par SargassumField.cs).
+// Culling GPU + flottaison des sargasses (comportement FloatOnWaves.cs).
 #pragma kernel NyxCull
 #pragma kernel NyxWriteArgs
 
@@ -21,7 +21,7 @@ float3x3 NyxFromToRotation(float3 from, float3 to)
         v.z * v.x * k - v.y,  v.z * v.y * k + v.x,  v.z * v.z * k + c);
 }
 
-// Disposition écrite par SargassumField.cs :
+// Disposition écrite par FloatOnWaves.CreateInstance :
 //   row0..row2 : matrice de repos 3x4 (lacet + échelle), translation x et z (y ignoré)
 //   custom     : x = graine 0..1, y = profondeur dans la couche d'algues (m, >= 0), w = variante
 bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)

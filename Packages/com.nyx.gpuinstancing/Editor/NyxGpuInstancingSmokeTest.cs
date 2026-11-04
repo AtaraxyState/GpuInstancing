@@ -18,8 +18,8 @@ namespace Nyx.GpuInstancing.Editor
     /// <summary>
     /// Vérification de l'installation dans un projet (GPU réel) : Tools > Nyx > GPU Instancing > Run Smoke Test.
     /// Construit la scène de démo dans Assets/NyxGpuInstancingTest/ (régénéré à chaque test), puis vérifie : compilation des
-    /// shaders et compute shaders, assets par défaut, valeurs par défaut à l'ajout d'un composant, culling GPU, LODs, rendu,
-    /// couche d'algues, bulles, Emit(), ombres. Écrit Logs/NyxGpuInstancingTest/report.md, des captures PNG et status.txt.
+    /// shaders et compute shaders, assets par défaut, comportements (liste, ajout, changement), culling GPU, LODs, rendu,
+    /// couche d'algues, bulles, Emit(), rochers, ombres. Écrit Logs/NyxGpuInstancingTest/report.md, des captures PNG et status.txt.
     /// En batchmode (sans -nographics) : -executeMethod Nyx.GpuInstancing.Editor.NyxGpuInstancingSmokeTest.RunFromCommandLine.
     /// </summary>
     public static class NyxGpuInstancingSmokeTest
@@ -105,7 +105,7 @@ namespace Nyx.GpuInstancing.Editor
 
         static void RunChecks(Report report)
         {
-            var package = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(SargassumField).Assembly);
+            var package = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(MeshSpawner).Assembly);
             report.notes.Add($"Unity {Application.unityVersion}, {SystemInfo.graphicsDeviceType}, {SystemInfo.graphicsDeviceName}, " +
                              $"pipeline : {(GraphicsSettings.currentRenderPipeline != null ? GraphicsSettings.currentRenderPipeline.GetType().Name : "Built-in")}");
             report.notes.Add($"Package : {(package != null ? $"{package.name} {package.version} ({package.source}, {package.assetPath})" : "copié dans Assets")}, " +
@@ -117,17 +117,26 @@ namespace Nyx.GpuInstancing.Editor
             Shader sargassumShader = Shader.Find(NyxDefaultAssets.SargassumShaderName);
             Shader bubbleShader = Shader.Find(NyxDefaultAssets.BubbleShaderName);
             Shader waterShader = Shader.Find(NyxDefaultAssets.WaterShaderName);
-            var sargassumCulling = Resources.Load<ComputeShader>("NyxGpuInstancing/NyxSargassumCulling");
-            var bubbleCulling = Resources.Load<ComputeShader>("NyxGpuInstancing/NyxBubbleCulling");
+            Shader litShader = Shader.Find(NyxDefaultAssets.LitShaderName);
             CheckShader(report, sargassumShader, NyxDefaultAssets.SargassumShaderName);
             CheckShader(report, bubbleShader, NyxDefaultAssets.BubbleShaderName);
             CheckShader(report, waterShader, NyxDefaultAssets.WaterShaderName);
-            CheckCompute(report, sargassumCulling, "NyxGpuInstancing/NyxSargassumCulling");
-            CheckCompute(report, bubbleCulling, "NyxGpuInstancing/NyxBubbleCulling");
-            if (sargassumShader == null || bubbleShader == null || sargassumCulling == null || bubbleCulling == null)
+            CheckShader(report, litShader, NyxDefaultAssets.LitShaderName);
+            bool computesFound = true;
+            foreach (string compute in new[] { "FloatOnWaves", "BubbleColumns", "StaticInstances" })
+            {
+                var shader = Resources.Load<ComputeShader>("NyxGpuInstancing/" + compute);
+                CheckCompute(report, shader, "NyxGpuInstancing/" + compute);
+                computesFound &= shader != null;
+            }
+            if (sargassumShader == null || bubbleShader == null || litShader == null || !computesFound)
                 return;
 
-            // ---------------------------------------------------------------- 2. Scène de démo (assets par défaut)
+            // ---------------------------------------------------------------- 2. Comportements : liste, ajout, changement
+            List<Type> behaviors = MeshSpawnerTools.BehaviorTypes;
+            report.Check(behaviors.Contains(typeof(FloatOnWaves)) && behaviors.Contains(typeof(BubbleColumns)) && behaviors.Contains(typeof(StaticInstances)),
+                "Comportements proposés dans l'inspecteur du MeshSpawner", string.Join(", ", behaviors.ConvertAll(type => type.Name)));
+
             NyxGpuInstancingDemo.Contents demo = NyxGpuInstancingDemo.Build(null);
             if (AssetDatabase.IsValidFolder(TestFolder))
                 AssetDatabase.DeleteAsset(TestFolder);
@@ -135,34 +144,58 @@ namespace Nyx.GpuInstancing.Editor
 
             Material sargassumMaterial = NyxDefaultAssets.SargassumMaterial;
             Material bubbleMaterial = NyxDefaultAssets.BubbleMaterial;
+            Material rockMaterial = NyxDefaultAssets.RockMaterial;
             report.Check(sargassumMaterial.shader == sargassumShader && sargassumMaterial.enableInstancing && sargassumMaterial.mainTexture != null
-                         && bubbleMaterial.shader == bubbleShader && bubbleMaterial.enableInstancing,
-                "Assets par défaut : matériaux sargasses et bulles, GPU Instancing coché", AssetDatabase.GetAssetPath(sargassumMaterial));
+                         && bubbleMaterial.shader == bubbleShader && bubbleMaterial.enableInstancing
+                         && rockMaterial.shader == litShader && rockMaterial.enableInstancing,
+                "Assets par défaut : matériaux sargasses, bulles et rochers, GPU Instancing coché", NyxDefaultAssets.Folder);
 
-            // Ajout comme dans l'inspecteur (« Add Component ») : touffes, matériaux et compute shader sans réglage
-            var probe = new GameObject("Ajout de composants");
-            var addedSargassum = ObjectFactory.AddComponent<SargassumField>(probe);
-            var addedBubbles = ObjectFactory.AddComponent<BubbleField>(probe);
-            var probeSargassum = new SerializedObject(addedSargassum);
-            var probeBubbles = new SerializedObject(addedBubbles);
-            report.Check(probeSargassum.FindProperty("variants").arraySize == 2 && probeSargassum.FindProperty("cullingShader").objectReferenceValue == sargassumCulling
-                         && probeBubbles.FindProperty("bubbleMaterial").objectReferenceValue == bubbleMaterial && probeBubbles.FindProperty("emitters").arraySize == 1,
-                "Add Component : le champ reçoit touffes, matériau et compute shader par défaut",
-                $"{probeSargassum.FindProperty("variants").arraySize} variantes, compute {(probeSargassum.FindProperty("cullingShader").objectReferenceValue != null ? "ok" : "absent")}, " +
-                $"{probeBubbles.FindProperty("emitters").arraySize} émetteur");
+            // Ajout d'un comportement comme dans l'inspecteur (« Add Component ») : MeshSpawner ajouté, meshes par défaut
+            var probe = new GameObject("Ajout de comportement");
+            probe.transform.position = new Vector3(500f, -5f, 500f);
+            ObjectFactory.AddComponent<FloatOnWaves>(probe);
+            var probeSpawner = probe.GetComponent<MeshSpawner>();
+            report.Check(probeSpawner != null && probeSpawner.Variants.Count == 2 && probeSpawner.Behavior is FloatOnWaves,
+                "Add Component « Float On Waves » : MeshSpawner ajouté, touffes et matériau par défaut",
+                probeSpawner != null ? $"{probeSpawner.Variants.Count} variantes" : "pas de MeshSpawner");
+            if (probeSpawner != null)
+            {
+                probeSpawner.RebuildNow();
+                int floating = probeSpawner.InstanceCount;
+                MeshSpawnerTools.SetBehavior(probeSpawner, typeof(StaticInstances), replaceVariants: true);
+                probeSpawner.RebuildNow();
+                bool toStatic = probeSpawner.Behavior is StaticInstances && probeSpawner.GetComponents<MeshSpawnerBehavior>().Length == 1
+                                && probeSpawner.Variants[0].material == rockMaterial && probeSpawner.InstanceCount == floating && probeSpawner.DrawCallsPerCamera == 2;
+                MeshSpawnerTools.SetBehavior(probeSpawner, typeof(BubbleColumns), replaceVariants: true);
+                probeSpawner.RebuildNow();
+                int bubbleCount = probeSpawner.InstanceCount;
+                bool toBubbles = probeSpawner.Behavior is BubbleColumns && probeSpawner.Variants[0].material == bubbleMaterial
+                                 && bubbleCount == 40 + 1024 && probeSpawner.DrawCallsPerCamera == 3;
+                report.Check(floating > 0 && toStatic && toBubbles,
+                    "Changer de comportement : Float On Waves -> Static Instances -> Bubble Columns, même placement, meshes remplacés",
+                    $"{floating} instances flottantes, {(toStatic ? "statiques ok" : "statiques KO")}, {bubbleCount} bulles (40 + tampon de 1024)");
+                MeshSpawnerTools.SetBehavior(probeSpawner, null);
+                probeSpawner.RebuildNow();
+                report.Check(probeSpawner.Behavior == null && probeSpawner.InstanceCount == 0, "Sans comportement : rien n'est dessiné", $"{probeSpawner.InstanceCount} instances");
+            }
             Object.DestroyImmediate(probe);
 
-            SargassumField sargassum = demo.sargassum;
-            BubbleField bubbles = demo.bubbles;
+            MeshSpawner sargassum = demo.sargassum;
+            MeshSpawner bubbles = demo.bubbles;
+            MeshSpawner rocks = demo.rocks;
+            var floatOnWaves = sargassum.GetComponent<FloatOnWaves>();
+            var bubbleColumns = bubbles.GetComponent<BubbleColumns>();
             demo.water.SetActive(false);   // mesures sur les instances seules ; l'eau est vérifiée à la fin
             Camera surfaceCamera = MakeCamera("Cam_Surface", new Vector3(0f, 6f, -45f), new Vector3(0f, 0f, -5f), new Color(0.55f, 0.70f, 0.85f), 60f);
             Camera skyCamera = MakeCamera("Cam_Sky", new Vector3(0f, 12f, 0f), new Vector3(0f, 30f, 0.01f), new Color(0.55f, 0.70f, 0.85f), 60f);
             Camera underwaterCamera = MakeCamera("Cam_Underwater", new Vector3(0f, -6f, -2f), new Vector3(0f, -4f, 10f), new Color(0.03f, 0.20f, 0.30f), 70f);
+            Camera seabedCamera = MakeCamera("Cam_Fond", new Vector3(0f, -7f, -30f), new Vector3(0f, -12f, 0f), new Color(0.03f, 0.20f, 0.30f), 60f);
 
             // ---------------------------------------------------------------- 3. Draws et instances
             report.Check(sargassum.InstanceCount > 0, "Sargasses : instances générées", $"{sargassum.InstanceCount} touffes");
             report.Check(sargassum.DrawCallsPerCamera == 4, "Sargasses : 4 draws (2 variantes x 2 LODs) quel que soit le nombre de touffes", $"{sargassum.DrawCallsPerCamera} draws");
             report.Check(bubbles.DrawCallsPerCamera == 3, "Bulles : 3 draws (3 LODs)", $"{bubbles.DrawCallsPerCamera} draws, {bubbles.InstanceCount} instances");
+            report.Check(rocks.InstanceCount > 0 && rocks.DrawCallsPerCamera == 2, "Rochers : instances générées, 2 draws (2 LODs)", $"{rocks.InstanceCount} rochers, {rocks.DrawCallsPerCamera} draws");
 
             // ---------------------------------------------------------------- 4. Surface : culling, LOD, image
             var counts = new List<int>();
@@ -188,13 +221,13 @@ namespace Nyx.GpuInstancing.Editor
             bool readSky = sargassum.TryReadVisibleCounts(skyCamera, counts);
             int visibleSky = readSky ? Sum(counts) : 0;
             report.Check(visibleSky == 0, "Culling : caméra tournée vers le ciel -> 0 touffe",
-                readSky ? $"{visibleSky} visibles" : "champ rejeté en entier côté CPU, aucun dispatch");
+                readSky ? $"{visibleSky} visibles" : "spawner rejeté en entier côté CPU, aucun dispatch");
 
             // ---------------------------------------------------------------- 6. Épaisseur de la couche d'algues
             float minDepth = float.MaxValue, maxDepth = float.MinValue;
-            foreach (SargassumPlacement placement in sargassum.Placements)
+            foreach (MeshPlacement placement in sargassum.Placements)
             {
-                float depth = sargassum.GetLayerDepth(placement);
+                float depth = floatOnWaves.GetLayerDepth(placement);
                 minDepth = Mathf.Min(minDepth, depth);
                 maxDepth = Mathf.Max(maxDepth, depth);
             }
@@ -208,13 +241,13 @@ namespace Nyx.GpuInstancing.Editor
             slabCamera.orthographicSize = 50f;
             slabCamera.nearClipPlane = 150.3f;
             slabCamera.farClipPlane = 180f;
-            int belowWithLayer = VisibleWithLayer(sargassum, slabCamera, LayerThickness, counts);
-            int belowWithoutLayer = VisibleWithLayer(sargassum, slabCamera, 0f, counts);
+            int belowWithLayer = VisibleWithLayer(sargassum, floatOnWaves, slabCamera, LayerThickness, counts);
+            int belowWithoutLayer = VisibleWithLayer(sargassum, floatOnWaves, slabCamera, 0f, counts);
             report.Check(belowWithoutLayer == 0 && belowWithLayer > sargassum.InstanceCount / 4,
                 "Couche d'algues (GPU) : les touffes profondes descendent sous la surface",
                 $"touffes sous y = -0,3 m, eau plate : {belowWithLayer} avec la couche, {belowWithoutLayer} sans");
             Object.DestroyImmediate(slabCamera.gameObject);
-            SetFloat(sargassum, "layerThickness", LayerThickness);
+            SetFloat(floatOnWaves, "layerThickness", LayerThickness);
             demo.waves.enabled = true;
             sargassum.RebuildNow();
             bubbles.RebuildNow();
@@ -240,16 +273,30 @@ namespace Nyx.GpuInstancing.Editor
             Render(underwaterCamera);
             bubbles.TryReadVisibleCounts(underwaterCamera, counts);
             int before = Sum(counts);
-            bubbles.Emit(new Vector3(0f, -7f, 6f), 150, 0.6f);
+            bubbleColumns.Emit(new Vector3(0f, -7f, 6f), 150, 0.6f);
             Thread.Sleep(400);   // apparition des bulles : 0,12 s par défaut
             Texture2D afterEmit = Render(underwaterCamera);
             bubbles.TryReadVisibleCounts(underwaterCamera, counts);
             int after = Sum(counts);
             report.Check(after >= before + 75, "Emit() : 150 bulles émises dans le champ de vision apparaissent", $"{before} -> {after}");
             SavePng(report, afterEmit, "sous_marin_apres_emit");
+
+            // ---------------------------------------------------------------- 9. Rochers immobiles sur le fond
+            Render(seabedCamera);
+            Texture2D seabedOn = Render(seabedCamera);
+            rocks.TryReadVisibleCounts(seabedCamera, counts);
+            int rocksVisible = Sum(counts);
+            report.Check(rocksVisible > 0 && rocksVisible < rocks.InstanceCount, "Rochers : culling GPU, une partie est visible depuis le fond",
+                $"{rocksVisible} / {rocks.InstanceCount} ({Describe(rocks, counts)})");
+            rocks.enabled = false;
+            Texture2D seabedOff = Render(seabedCamera);
+            rocks.enabled = true;
+            int rockDiff = CountDifferentPixels(seabedOn, seabedOff);
+            report.Check(rockDiff > ImageSize * ImageSize / 100, "Rendu : les rochers apparaissent (shader Lit)", $"{100.0 * rockDiff / (ImageSize * ImageSize):F1} % de l'image change");
+            SavePng(report, seabedOn, "fond_rochers");
             RenderSettings.fog = false;
 
-            // ---------------------------------------------------------------- 9. Ombres
+            // ---------------------------------------------------------------- 10. Ombres
             var receiverMaterial = new Material(Shader.Find("Standard")) { name = "ShadowReceiver_Test", color = new Color(0.10f, 0.35f, 0.45f) };
             AssetDatabase.CreateAsset(receiverMaterial, TestFolder + "/ShadowReceiver_Test.mat");
             GameObject receiver = GameObject.CreatePrimitive(PrimitiveType.Quad);
@@ -282,7 +329,7 @@ namespace Nyx.GpuInstancing.Editor
             shadowSettings.ApplyModifiedPropertiesWithoutUndo();
             sargassum.RebuildNow();
 
-            // ---------------------------------------------------------------- 10. Eau de démo (suit la houle)
+            // ---------------------------------------------------------------- 11. Eau de démo (suit la houle)
             demo.water.SetActive(true);
             Render(surfaceCamera);
             Texture2D withWater = Render(surfaceCamera);
@@ -298,8 +345,9 @@ namespace Nyx.GpuInstancing.Editor
             CheckShader(report, sargassumShader, NyxDefaultAssets.SargassumShaderName + " (après rendu)");
             CheckShader(report, bubbleShader, NyxDefaultAssets.BubbleShaderName + " (après rendu)");
             CheckShader(report, waterShader, NyxDefaultAssets.WaterShaderName + " (après rendu)");
+            CheckShader(report, litShader, NyxDefaultAssets.LitShaderName + " (après rendu)");
 
-            // ---------------------------------------------------------------- 11. Chiffres
+            // ---------------------------------------------------------------- 12. Chiffres
             var watch = Stopwatch.StartNew();
             const int frames = 50;
             for (int i = 0; i < frames; i++)
@@ -307,11 +355,13 @@ namespace Nyx.GpuInstancing.Editor
             watch.Stop();
             report.notes.Add($"Sargasses : {sargassum.InstanceCount} instances, {sargassum.DrawCallsPerCamera} draws, {sargassum.GpuMemoryBytes / 1024} Ko GPU (toutes caméras du test)");
             report.notes.Add($"Bulles : {bubbles.InstanceCount} instances, {bubbles.DrawCallsPerCamera} draws, {bubbles.GpuMemoryBytes / 1024} Ko GPU");
+            report.notes.Add($"Rochers : {rocks.InstanceCount} instances, {rocks.DrawCallsPerCamera} draws, {rocks.GpuMemoryBytes / 1024} Ko GPU");
             report.notes.Add($"Rendu complet Cam_Surface avec l'eau (éditeur, CPU) : {watch.Elapsed.TotalMilliseconds / frames:F2} ms en moyenne sur {frames} images");
 
             Object.DestroyImmediate(surfaceCamera.gameObject);
             Object.DestroyImmediate(skyCamera.gameObject);
             Object.DestroyImmediate(underwaterCamera.gameObject);
+            Object.DestroyImmediate(seabedCamera.gameObject);
             EditorSceneManager.SaveScene(demo.scene, TestFolder + "/SmokeTest.unity");
         }
 
@@ -357,12 +407,12 @@ namespace Nyx.GpuInstancing.Editor
             settings.ApplyModifiedPropertiesWithoutUndo();
         }
 
-        static int VisibleWithLayer(SargassumField field, Camera camera, float thickness, List<int> counts)
+        static int VisibleWithLayer(MeshSpawner spawner, FloatOnWaves floating, Camera camera, float thickness, List<int> counts)
         {
-            SetFloat(field, "layerThickness", thickness);
-            field.RebuildNow();
+            SetFloat(floating, "layerThickness", thickness);
+            spawner.RebuildNow();
             Render(camera, readBack: false);
-            return field.TryReadVisibleCounts(camera, counts) ? Sum(counts) : 0;
+            return spawner.TryReadVisibleCounts(camera, counts) ? Sum(counts) : 0;
         }
 
         static Camera MakeCamera(string name, Vector3 position, Vector3 target, Color background, float fieldOfView)
@@ -447,7 +497,7 @@ namespace Nyx.GpuInstancing.Editor
             return total;
         }
 
-        static int SumLod(InstancedFieldBase field, List<int> counts, string lod)
+        static int SumLod(MeshSpawner field, List<int> counts, string lod)
         {
             int total = 0;
             IReadOnlyList<string> labels = field.DrawLabels;
@@ -459,7 +509,7 @@ namespace Nyx.GpuInstancing.Editor
             return total;
         }
 
-        static string Describe(InstancedFieldBase field, List<int> counts)
+        static string Describe(MeshSpawner field, List<int> counts)
         {
             var text = new StringBuilder();
             IReadOnlyList<string> labels = field.DrawLabels;

@@ -9,7 +9,7 @@ namespace Nyx.GpuInstancing
     public class BubbleEmitter
     {
         [Tooltip("Optionnel : repère du point d'émission (lu à la construction ; en jeu, appeler SetDirty() après l'avoir déplacé). " +
-                 "Sinon : Local Position, relative au BubbleField. Pour une source mobile (plongeur, drone), utiliser Emit().")]
+                 "Sinon : Local Position, relative à cet objet. Pour une source mobile (plongeur, drone), utiliser Emit().")]
         public Transform anchor;
         public Vector3 localPosition;
         [Tooltip("Rayon horizontal de la zone d'émission (m).")]
@@ -27,27 +27,18 @@ namespace Nyx.GpuInstancing
     }
 
     /// <summary>
-    /// Bulles sous-marines : 1 dispatch de culling GPU + 1 draw par LOD, quel que soit le nombre de bulles.
-    /// Position, taille (loi de Boyle), spirale, oscillation de forme et éclatement sont des fonctions
-    /// du temps évaluées sur GPU : aucune donnée n'est renvoyée par le CPU à chaque frame.
+    /// Comportement : bulles sous-marines. Position, taille (loi de Boyle), spirale, oscillation de forme et éclatement
+    /// sont des fonctions du temps évaluées sur GPU : aucune donnée n'est renvoyée par le CPU à chaque frame.
     ///  - Émetteurs : colonnes en boucle infinie (évents, fuites, ambiance). Coût CPU par frame : 0.
     ///  - Emit()    : bulles ponctuelles (respiration de plongeur, hélice, impact), tampon circulaire.
     ///                Coût : upload de count × 64 octets au moment de l'appel.
+    /// N'utilise pas le placement du MeshSpawner. Matériau : Nyx/GPU Instancing/Bubble (variante 0).
     /// </summary>
-    [ExecuteAlways]
-    [AddComponentMenu("Nyx/GPU Instancing/Bubble Field")]
-    public sealed class BubbleField : InstancedFieldBase
+    [AddComponentMenu("Nyx/GPU Instancing/Behaviors/Bubble Columns")]
+    public sealed class BubbleColumns : MeshSpawnerBehavior
     {
-        [Header("Apparence")]
-        [Tooltip("Matériau utilisant le shader Nyx/GPU Instancing/Bubble.")]
-        [SerializeField] Material bubbleMaterial;
-        [Tooltip("Vide = icosphères procédurales : 162 / 42 / 12 sommets selon la distance.")]
-        [SerializeField] Mesh[] customLodMeshes = new Mesh[0];
-        [Tooltip("Distances (m) de passage au LOD suivant.")]
-        [SerializeField] float[] lodDistances = { 3f, 10f };
-
         [Header("Émetteurs en boucle")]
-        [SerializeField] List<BubbleEmitter> emitters = new List<BubbleEmitter>();
+        [SerializeField] List<BubbleEmitter> emitters = new List<BubbleEmitter> { new BubbleEmitter() };
 
         [Header("Émissions ponctuelles (Emit)")]
         [Tooltip("Taille du tampon circulaire = nombre max de bulles ponctuelles en vol. Les plus anciennes sont recyclées.")]
@@ -79,34 +70,18 @@ namespace Nyx.GpuInstancing
 
         const float BurstZoneMergeWindow = 0.5f;
 
-        readonly List<InstanceVariant> _variants = new List<InstanceVariant>(1);
         readonly List<Vector3> _emitterPositions = new List<Vector3>();
         readonly List<BurstZone> _burstZones = new List<BurstZone>();
-        Mesh[] _generatedMeshes;
         GpuInstanceData[] _burst = Array.Empty<GpuInstanceData>();
         int _burstCursor;
         int _ambientCount;
         System.Random _emitRandom;
 
-        protected override string DefaultCullingShaderName => "NyxGpuInstancing/NyxBubbleCulling";
+        protected override string CullingShaderResource => "NyxGpuInstancing/BubbleColumns";
 
-#if UNITY_EDITOR
-        protected override void Reset()
-        {
-            base.Reset();
-            ApplyEditorDefaults();
-        }
+        public override bool UsesPlacement => false;
 
-        /// <summary>Éditeur : matériau par défaut et une colonne de bulles s'ils manquent (champ visible sans réglage).</summary>
-        public void ApplyEditorDefaults()
-        {
-            if (bubbleMaterial == null)
-                bubbleMaterial = NyxDefaultAssets.BubbleMaterial;
-            if (emitters.Count == 0)
-                emitters.Add(new BubbleEmitter());
-            SetDirty();
-        }
-#endif
+        public IList<BubbleEmitter> Emitters => emitters;
 
         /// <summary>
         /// Émet 'count' bulles autour de 'position' (dans un rayon 'spread'). Sans effet hors de l'eau.
@@ -125,7 +100,7 @@ namespace Nyx.GpuInstancing
                 _emitRandom = new System.Random(randomSeed ^ 0x5bd1e995);
 
             BubbleEmitter settings = burstSettings ?? new BubbleEmitter();
-            float now = CurrentTime;
+            float now = MeshSpawner.CurrentTime;
             float margin = travel + spread + OceanWaves.MaxVerticalDisplacement;
             count = Mathf.Min(count, burstCapacity);
             int first = _burstCursor;
@@ -171,81 +146,7 @@ namespace Nyx.GpuInstancing
                 UploadBurst(0, count - firstPart);
         }
 
-        protected override void OnDisable()
-        {
-            base.OnDisable();
-            if (_generatedMeshes == null)
-                return;
-            foreach (Mesh mesh in _generatedMeshes)
-            {
-                if (mesh == null)
-                    continue;
-                if (Application.isPlaying)
-                    Destroy(mesh);
-                else
-                    DestroyImmediate(mesh);
-            }
-            _generatedMeshes = null;
-        }
-
-        void Update()
-        {
-            // Mode édition uniquement : les colonnes suivent les émetteurs pendant qu'on les place.
-            // En jeu, une reconstruction change la période des bulles et les ferait sauter : SetDirty() explicite,
-            // et Emit() / BubbleBurstEmitter pour toute source mobile.
-            if (Application.isPlaying)
-                return;
-            for (int e = 0; e < emitters.Count && e < _emitterPositions.Count; e++)
-            {
-                BubbleEmitter emitter = emitters[e];
-                if (emitter != null && (EmitterPosition(emitter) - _emitterPositions[e]).sqrMagnitude > 1e-6f)
-                {
-                    SetDirty();
-                    return;
-                }
-            }
-        }
-
-        protected override void LateUpdate()
-        {
-            if (_burstZones.Count > 0)
-                RefreshBurstBounds(CurrentTime);
-            base.LateUpdate();
-        }
-
-        /// <summary>Oublie les zones dont toutes les bulles ont éclaté et recalcule les bounds dynamiques du draw.</summary>
-        void RefreshBurstBounds(float now)
-        {
-            for (int i = _burstZones.Count - 1; i >= 0; i--)   // boucle manuelle : pas d'allocation par frame
-            {
-                if (_burstZones[i].expiresAt < now)
-                    _burstZones.RemoveAt(i);
-            }
-            if (_burstZones.Count == 0)
-            {
-                SetDynamicBounds(null);
-                return;
-            }
-            Bounds union = _burstZones[0].bounds;
-            for (int i = 1; i < _burstZones.Count; i++)
-                union.Encapsulate(_burstZones[i].bounds);
-            SetDynamicBounds(union);
-        }
-
-        protected override IReadOnlyList<InstanceVariant> GetVariants()
-        {
-            bool custom = customLodMeshes != null && customLodMeshes.Length > 0 && customLodMeshes[0] != null;
-            _variants.Clear();
-            _variants.Add(new InstanceVariant
-            {
-                lodMeshes = custom ? customLodMeshes : GeneratedMeshes(),
-                lodDistances = lodDistances,
-                material = bubbleMaterial
-            });
-            return _variants;
-        }
-
-        protected override Bounds BuildInstances(List<GpuInstanceData> output)
+        public override Bounds BuildInstances(List<GpuInstanceData> output)
         {
             var random = new System.Random(randomSeed);
             float waterLevel = OceanWaves.WaterLevel;
@@ -284,15 +185,71 @@ namespace Nyx.GpuInstancing
             //    ses bounds sont gérées à part, par zones qui expirent : voir RefreshBurstBounds)
             EnsureBurstBuffer();
             output.AddRange(_burst);
-
             return bounds;
         }
 
-        protected override void SetSystemParameters(ComputeShader shader, Camera camera)
+        public override void SetShaderParameters(ComputeShader shader, Camera camera)
         {
             OceanWaves.ApplyTo(shader);
             shader.SetVector(BubbleShapeId, new Vector4(maxFlatness, flatnessRadius, shapeWobbleSpeed, popDistance));
             shader.SetVector(BubbleTimingId, new Vector4(growInTime, 0f, 0f, 0f));
+        }
+
+#if UNITY_EDITOR
+        public override List<InstanceVariant> CreateDefaultVariants() => NyxDefaultAssets.BubbleVariants();
+#endif
+
+        protected override void OnDisable()
+        {
+            base.OnDisable();
+            _burstZones.Clear();
+            if (Spawner != null)
+                Spawner.SetDynamicBounds(null);
+        }
+
+        void Update()
+        {
+            // Mode édition uniquement : les colonnes suivent les émetteurs pendant qu'on les place.
+            // En jeu, une reconstruction change la période des bulles et les ferait sauter : SetDirty() explicite,
+            // et Emit() / BubbleBurstEmitter pour toute source mobile.
+            if (Application.isPlaying)
+                return;
+            for (int e = 0; e < emitters.Count && e < _emitterPositions.Count; e++)
+            {
+                BubbleEmitter emitter = emitters[e];
+                if (emitter != null && (EmitterPosition(emitter) - _emitterPositions[e]).sqrMagnitude > 1e-6f)
+                {
+                    SetDirty();
+                    return;
+                }
+            }
+        }
+
+        void LateUpdate()
+        {
+            if (_burstZones.Count > 0)
+                RefreshBurstBounds(MeshSpawner.CurrentTime);
+        }
+
+        /// <summary>Oublie les zones dont toutes les bulles ont éclaté et recalcule les bounds dynamiques du draw.</summary>
+        void RefreshBurstBounds(float now)
+        {
+            for (int i = _burstZones.Count - 1; i >= 0; i--)   // boucle manuelle : pas d'allocation par frame
+            {
+                if (_burstZones[i].expiresAt < now)
+                    _burstZones.RemoveAt(i);
+            }
+            if (Spawner == null)
+                return;
+            if (_burstZones.Count == 0)
+            {
+                Spawner.SetDynamicBounds(null);
+                return;
+            }
+            Bounds union = _burstZones[0].bounds;
+            for (int i = 1; i < _burstZones.Count; i++)
+                union.Encapsulate(_burstZones[i].bounds);
+            Spawner.SetDynamicBounds(union);
         }
 
         /// <summary>Adapte le tampon circulaire à burstCapacity. Renvoie true s'il a été redimensionné.</summary>
@@ -308,24 +265,15 @@ namespace Nyx.GpuInstancing
             return true;
         }
 
+        /// <summary>Cases du tampon -> GPU. Si le spawner n'est pas à jour, la prochaine reconstruction reprendra _burst tel quel.</summary>
         void UploadBurst(int burstIndex, int count)
         {
-            if (!IsBuilt || count <= 0)
-                return;   // la prochaine reconstruction reprendra _burst tel quel
-            int instanceIndex = _ambientCount + burstIndex;
-            Array.Copy(_burst, burstIndex, instances, instanceIndex, count);
-            UploadInstances(instanceIndex, count);
+            if (Spawner != null)
+                Spawner.UploadInstances(_ambientCount + burstIndex, _burst, burstIndex, count);
         }
 
         Vector3 EmitterPosition(BubbleEmitter emitter) =>
             emitter.anchor != null ? emitter.anchor.TransformPoint(emitter.localPosition) : transform.TransformPoint(emitter.localPosition);
-
-        Mesh[] GeneratedMeshes()
-        {
-            if (_generatedMeshes == null || _generatedMeshes[0] == null)
-                _generatedMeshes = new[] { IcosphereBuilder.Build(2), IcosphereBuilder.Build(1), IcosphereBuilder.Build(0) };
-            return _generatedMeshes;
-        }
 
         static GpuInstanceData MakeBubble(Vector3 spawn, float spawnTime, float surfaceRadius, float speed, float lifetime,
                                           bool loop, float spiralRadius, float spiralFrequency, float seed)

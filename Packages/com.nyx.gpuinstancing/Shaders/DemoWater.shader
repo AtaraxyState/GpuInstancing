@@ -1,11 +1,11 @@
 // Eau de démonstration : surface transparente déplacée par la même houle que les sargasses (OceanWaves.hlsl).
 // Sert d'exemple de synchronisation pour le shader d'eau d'un projet : même fonction, même temps, même niveau.
-// Mesh attendu : grille plate posée au niveau de l'eau (NyxDefaultAssets.WaterMesh).
+// Mesh attendu : grille plate posée au niveau de l'eau (générée par NyxDemoWater).
 Shader "Nyx/GPU Instancing/Demo Water"
 {
     Properties
     {
-        _Color ("Couleur (alpha = opacité)", Color) = (0.10, 0.40, 0.48, 0.55)
+        _Color ("Couleur (alpha = opacité)", Color) = (0.10, 0.40, 0.48, 0.80)
         _GrazingColor ("Couleur rasante", Color) = (0.30, 0.50, 0.58, 0.90)
         _Specular ("Reflet du soleil", Range(0, 2)) = 0.8
     }

@@ -1,0 +1,19 @@
+// Exemple du README du package (« Écrire un comportement ») : instances qui montent et descendent.
+#pragma kernel NyxCull
+#pragma kernel NyxWriteArgs
+#include "Packages/com.nyx.gpuinstancing/Shaders/ShaderLibrary/InstancingData.hlsl"
+
+float _NyxTime;       // temps (s), posé par le Mesh Spawner
+float4 _Bobbing;      // x : amplitude (m), y : vitesse, posé par SetShaderParameters
+
+bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)
+{
+    dst.row0 = src.row0;                 // matrice 3x4 écrite par CreateInstance (position, lacet, échelle)
+    dst.row1 = src.row1;
+    dst.row2 = src.row2;
+    dst.row1.w += sin(_NyxTime * _Bobbing.y + src.custom.x * 6.2832) * _Bobbing.x;   // monte et descend
+    dst.custom = src.custom;             // x : graine, w : variante (ne pas modifier)
+    return true;                         // false = instance ignorée
+}
+
+#include "Packages/com.nyx.gpuinstancing/Shaders/ShaderLibrary/InstancingCulling.hlsl"

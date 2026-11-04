@@ -1,5 +1,5 @@
 // Sargasses instanciées (pipeline Built-in) : alpha-test, double face, ondulation des frondes,
-// teinte variable par instance, contre-jour. À dessiner via SargassumField (DrawMeshInstancedIndirect).
+// teinte variable par instance, contre-jour. À dessiner via un MeshSpawner + Float On Waves (DrawMeshInstancedIndirect).
 Shader "Nyx/GPU Instancing/Sargassum"
 {
     Properties

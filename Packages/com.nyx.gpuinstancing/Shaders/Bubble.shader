@@ -1,5 +1,5 @@
 // Bulles instanciées (pipeline Built-in) : transparentes, bord argenté (réflexion totale interne),
-// reflet du soleil, brouillard sous-marin. À dessiner via BubbleField (DrawMeshInstancedIndirect).
+// reflet du soleil, brouillard sous-marin. À dessiner via un MeshSpawner + Bubble Columns (DrawMeshInstancedIndirect).
 // Compatible VR Single Pass Instanced (macros stéréo) et multiview.
 Shader "Nyx/GPU Instancing/Bubble"
 {

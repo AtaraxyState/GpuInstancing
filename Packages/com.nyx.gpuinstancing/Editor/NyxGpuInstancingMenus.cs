@@ -8,36 +8,41 @@ namespace Nyx.GpuInstancing.Editor
 {
     /// <summary>
     /// Création en un clic :
-    ///  - GameObject > Nyx > GPU Instancing > Sargassum Field / Bubble Field / Ocean Waves / Demo Water ;
+    ///  - GameObject > Nyx > GPU Instancing > Sargassum / Bubbles / Static Meshes : un MeshSpawner avec son comportement
+    ///    (Float On Waves, Bubble Columns, Static Instances), ses meshes et son matériau par défaut ;
+    ///  - GameObject > Nyx > GPU Instancing > Ocean Waves / Demo Water ;
     ///  - Tools > Nyx > GPU Instancing > Create Demo Scene.
-    /// Les champs créés ont leurs touffes, matériaux et compute shaders par défaut, et une houle (Ocean Waves) est ajoutée
-    /// à la scène si elle n'en a pas : rien à régler pour voir le résultat.
+    /// Une houle (Ocean Waves) est ajoutée à la scène si elle n'en a pas : rien à régler pour voir le résultat.
     /// </summary>
     public static class NyxGpuInstancingMenus
     {
         const string GameObjectMenu = "GameObject/Nyx/GPU Instancing/";
         public const string DemoScenePath = "Assets/NyxGpuInstancingDemo/NyxGpuInstancingDemo.unity";
 
-        [MenuItem(GameObjectMenu + "Sargassum Field", false, 10)]
-        static void CreateSargassumField(MenuCommand command)
+        [MenuItem(GameObjectMenu + "Sargassum (Float On Waves)", false, 10)]
+        static void CreateSargassum(MenuCommand command)
         {
             EnsureOceanWaves();
-            var field = Create<SargassumField>("Sargassum Field", command);
-            field.ApplyEditorDefaults();
+            Select(MeshSpawnerTools.Create<FloatOnWaves>("Sargassum", command.context as GameObject), command);
         }
 
-        [MenuItem(GameObjectMenu + "Bubble Field", false, 11)]
-        static void CreateBubbleField(MenuCommand command)
+        [MenuItem(GameObjectMenu + "Bubbles (Bubble Columns)", false, 11)]
+        static void CreateBubbles(MenuCommand command)
         {
             EnsureOceanWaves();
-            var field = Create<BubbleField>("Bubble Field", command);
-            field.ApplyEditorDefaults();
-            // Une colonne de bulles a besoin d'eau au-dessus : champ posé sous la surface
-            if (field.transform.position.y > OceanWaves.WaterLevel - 2f)
-                field.transform.position = new Vector3(field.transform.position.x, OceanWaves.WaterLevel - 8f, field.transform.position.z);
+            var bubbles = MeshSpawnerTools.Create<BubbleColumns>("Bubbles", command.context as GameObject);
+            Select(bubbles, command);
+            // Une colonne de bulles a besoin d'eau au-dessus : objet posé sous la surface
+            Transform t = bubbles.transform;
+            if (t.position.y > OceanWaves.WaterLevel - 2f)
+                t.position = new Vector3(t.position.x, OceanWaves.WaterLevel - 8f, t.position.z);
         }
 
-        [MenuItem(GameObjectMenu + "Ocean Waves", false, 12)]
+        [MenuItem(GameObjectMenu + "Static Meshes (Static Instances)", false, 12)]
+        static void CreateStatic(MenuCommand command) =>
+            Select(MeshSpawnerTools.Create<StaticInstances>("Static Meshes", command.context as GameObject), command);
+
+        [MenuItem(GameObjectMenu + "Ocean Waves", false, 30)]
         static void CreateOceanWaves(MenuCommand command)
         {
             OceanWaves existing = FindOceanWaves();
@@ -47,10 +52,12 @@ namespace Nyx.GpuInstancing.Editor
                 Debug.Log("[Nyx GPU Instancing] La scène a déjà un Ocean Waves (un seul par scène).", existing);
                 return;
             }
-            Create<OceanWaves>("Ocean Waves", command);
+            GameObject waves = ObjectFactory.CreateGameObject("Ocean Waves", typeof(OceanWaves));
+            GameObjectUtility.SetParentAndAlign(waves, command.context as GameObject);
+            Selection.activeGameObject = waves;
         }
 
-        [MenuItem(GameObjectMenu + "Demo Water", false, 30)]
+        [MenuItem(GameObjectMenu + "Demo Water", false, 31)]
         static void CreateDemoWater(MenuCommand command)
         {
             EnsureOceanWaves();
@@ -74,21 +81,23 @@ namespace Nyx.GpuInstancing.Editor
             OceanWaves waves = FindOceanWaves();
             if (waves != null)
                 return waves;
-            waves = ObjectFactory.CreateGameObject("Ocean Waves", typeof(OceanWaves)).GetComponent<OceanWaves>();
-            return waves;
+            return ObjectFactory.CreateGameObject("Ocean Waves", typeof(OceanWaves)).GetComponent<OceanWaves>();
         }
 
-        /// <summary>Surface d'eau de démo (grille + shader Demo Water) qui suit la houle des sargasses.</summary>
+        /// <summary>Surface d'eau de démo (grille + shader Demo Water) qui suit la houle.</summary>
         public static GameObject CreateDemoWaterObject(float waterLevel)
         {
             var water = new GameObject("Demo Water");
             water.transform.position = new Vector3(0f, waterLevel, 0f);
-            water.AddComponent<NyxDemoWater>();   // grille générée au chargement, aucun asset
-            var renderer = water.GetComponent<MeshRenderer>();
-            renderer.sharedMaterial = NyxDefaultAssets.WaterMaterial;
-            renderer.shadowCastingMode = ShadowCastingMode.Off;
-            renderer.receiveShadows = false;
+            water.AddComponent<NyxDemoWater>().Material = NyxDefaultAssets.WaterMaterial;   // grille générée au chargement, aucun asset
             return water;
+        }
+
+        static void Select(Component created, MenuCommand command)
+        {
+            if (command.context == null && SceneView.lastActiveSceneView != null)
+                created.transform.position = SceneView.lastActiveSceneView.pivot;
+            Selection.activeGameObject = created.gameObject;
         }
 
         static OceanWaves FindOceanWaves()
@@ -99,23 +108,12 @@ namespace Nyx.GpuInstancing.Editor
             return Object.FindObjectOfType<OceanWaves>();
 #endif
         }
-
-        static T Create<T>(string name, MenuCommand command) where T : Component
-        {
-            GameObject gameObject = ObjectFactory.CreateGameObject(name);
-            GameObjectUtility.SetParentAndAlign(gameObject, command.context as GameObject);
-            if (command.context == null && SceneView.lastActiveSceneView != null)
-                gameObject.transform.position = SceneView.lastActiveSceneView.pivot;
-            var component = ObjectFactory.AddComponent<T>(gameObject);   // comme « Add Component » : Reset() reçoit les valeurs par défaut
-            Undo.RegisterCreatedObjectUndo(gameObject, "Créer " + name);
-            Selection.activeGameObject = gameObject;
-            return component;
-        }
     }
 
     /// <summary>
-    /// Scène de démonstration : mer (houle + eau de démo), couche de sargasses avec amas au-dessus d'une mine et d'un leurre,
-    /// colonnes de bulles et plongeur qui expire, caméra libre (clic droit + ZQSD, A/E, Maj, molette).
+    /// Scène de démonstration : mer (houle + eau de démo), sargasses avec amas au-dessus d'une mine et d'un leurre
+    /// (Float On Waves), colonnes de bulles et plongeur qui expire (Bubble Columns), rochers sur le fond (Static Instances),
+    /// caméra libre (clic droit + ZQSD, A/E, Maj, molette).
     /// </summary>
     public static class NyxGpuInstancingDemo
     {
@@ -125,8 +123,9 @@ namespace Nyx.GpuInstancing.Editor
             public Light sun;
             public OceanWaves waves;
             public GameObject water;
-            public SargassumField sargassum;
-            public BubbleField bubbles;
+            public MeshSpawner sargassum;
+            public MeshSpawner bubbles;
+            public MeshSpawner rocks;
             public Transform mine;
             public Transform decoy;
             public Camera camera;
@@ -151,6 +150,13 @@ namespace Nyx.GpuInstancing.Editor
             demo.waves = new GameObject("Ocean Waves").AddComponent<OceanWaves>();
             demo.water = NyxGpuInstancingMenus.CreateDemoWaterObject(OceanWaves.WaterLevel);
 
+            GameObject seabed = GameObject.CreatePrimitive(PrimitiveType.Plane);
+            seabed.name = "Fond marin";
+            Object.DestroyImmediate(seabed.GetComponent<Collider>());
+            seabed.transform.position = new Vector3(0f, -12f, 0f);
+            seabed.transform.localScale = new Vector3(16f, 1f, 16f);
+            seabed.GetComponent<MeshRenderer>().sharedMaterial = NyxDefaultAssets.SeabedMaterial;
+
             // Mine sous la surface (son point d'ancrage au repos sert aux amas d'algues) et leurre sans mine
             demo.mine = new GameObject("Mine (ancre)").transform;
             demo.mine.position = new Vector3(5f, 0f, 10f);
@@ -163,52 +169,63 @@ namespace Nyx.GpuInstancing.Editor
             demo.decoy = new GameObject("Leurre (ancre)").transform;
             demo.decoy.position = new Vector3(-12f, 0f, 0f);
 
-            demo.sargassum = new GameObject("Sargassum Field").AddComponent<SargassumField>();
-            demo.sargassum.ApplyEditorDefaults();
-            var sargassum = new SerializedObject(demo.sargassum);
-            sargassum.FindProperty("areaSize").vector2Value = new Vector2(80f, 80f);
-            sargassum.FindProperty("densityPer100m2").floatValue = 6f;
-            SerializedProperty anchors = sargassum.FindProperty("clusterAnchors");
+            // Sargasses : MeshSpawner + Float On Waves
+            demo.sargassum = AddSpawner<FloatOnWaves>("Sargasses (Float On Waves)", Vector3.zero, out FloatOnWaves floating);
+            var spawner = new SerializedObject(demo.sargassum);
+            spawner.FindProperty("areaSize").vector2Value = new Vector2(80f, 80f);
+            spawner.FindProperty("densityPer100m2").floatValue = 6f;
+            SerializedProperty anchors = spawner.FindProperty("clusterAnchors");
             anchors.arraySize = 2;
             anchors.GetArrayElementAtIndex(0).objectReferenceValue = demo.mine;
             anchors.GetArrayElementAtIndex(1).objectReferenceValue = demo.decoy;
-            sargassum.FindProperty("clusterRadius").floatValue = 4f;
-            sargassum.FindProperty("clumpsPerCluster").intValue = 30;
-            sargassum.FindProperty("maxDrawDistance").floatValue = 200f;
-            sargassum.FindProperty("layerThickness").floatValue = 0.4f;
-            sargassum.ApplyModifiedPropertiesWithoutUndo();
+            spawner.FindProperty("clusterRadius").floatValue = 4f;
+            spawner.FindProperty("clumpsPerCluster").intValue = 30;
+            spawner.FindProperty("maxDrawDistance").floatValue = 200f;
+            spawner.ApplyModifiedPropertiesWithoutUndo();
+            var floatSettings = new SerializedObject(floating);
+            floatSettings.FindProperty("layerThickness").floatValue = 0.4f;
+            floatSettings.ApplyModifiedPropertiesWithoutUndo();
             demo.sargassum.RebuildNow();
 
-            demo.bubbles = new GameObject("Bubble Field").AddComponent<BubbleField>();
-            demo.bubbles.transform.position = new Vector3(0f, -10f, 0f);
-            demo.bubbles.ApplyEditorDefaults();
-            var bubbles = new SerializedObject(demo.bubbles);
+            // Bulles : MeshSpawner + Bubble Columns
+            demo.bubbles = AddSpawner<BubbleColumns>("Bulles (Bubble Columns)", new Vector3(0f, -10f, 0f), out BubbleColumns columns);
+            var bubbles = new SerializedObject(columns);
             SerializedProperty emitters = bubbles.FindProperty("emitters");
-            Vector3[] columns = { new Vector3(-2f, 0f, 8f), new Vector3(0f, 0f, 10f), new Vector3(2.5f, 0f, 9f) };
-            emitters.arraySize = columns.Length;
-            for (int i = 0; i < columns.Length; i++)
+            Vector3[] positions = { new Vector3(-2f, 0f, 8f), new Vector3(0f, 0f, 10f), new Vector3(2.5f, 0f, 9f) };
+            emitters.arraySize = positions.Length;
+            for (int i = 0; i < positions.Length; i++)
             {
                 SerializedProperty emitter = emitters.GetArrayElementAtIndex(i);
                 emitter.FindPropertyRelative("anchor").objectReferenceValue = null;
-                emitter.FindPropertyRelative("localPosition").vector3Value = columns[i];
+                emitter.FindPropertyRelative("localPosition").vector3Value = positions[i];
                 emitter.FindPropertyRelative("radius").floatValue = 0.3f;
                 emitter.FindPropertyRelative("bubbleCount").intValue = 60;
                 emitter.FindPropertyRelative("surfaceRadius").vector2Value = new Vector2(0.012f, 0.03f);
             }
             bubbles.FindProperty("burstCapacity").intValue = 512;
             bubbles.FindProperty("burstSettings").FindPropertyRelative("surfaceRadius").vector2Value = new Vector2(0.012f, 0.03f);
-            bubbles.FindProperty("maxDrawDistance").floatValue = 60f;
             bubbles.ApplyModifiedPropertiesWithoutUndo();
+            SetFloat(demo.bubbles, "maxDrawDistance", 60f);
             demo.bubbles.RebuildNow();
 
-            // Plongeur immobile qui expire : exemple de source mobile (BubbleField.Emit)
+            // Rochers sur le fond : MeshSpawner + Static Instances
+            demo.rocks = AddSpawner<StaticInstances>("Rochers (Static Instances)", new Vector3(0f, -12f, 0f), out _);
+            var rocks = new SerializedObject(demo.rocks);
+            rocks.FindProperty("areaSize").vector2Value = new Vector2(70f, 70f);
+            rocks.FindProperty("densityPer100m2").floatValue = 4f;
+            rocks.FindProperty("scaleRange").vector2Value = new Vector2(0.6f, 2.2f);
+            rocks.FindProperty("castShadows").enumValueIndex = (int)ShadowCastingMode.On;
+            rocks.ApplyModifiedPropertiesWithoutUndo();
+            demo.rocks.RebuildNow();
+
+            // Plongeur immobile qui expire : exemple de source mobile (BubbleColumns.Emit)
             GameObject diver = GameObject.CreatePrimitive(PrimitiveType.Capsule);
             diver.name = "Plongeur (Bubble Burst Emitter)";
             Object.DestroyImmediate(diver.GetComponent<Collider>());
             diver.transform.SetPositionAndRotation(new Vector3(-3f, -6f, 6f), Quaternion.Euler(70f, 20f, 0f));
             diver.transform.localScale = new Vector3(0.5f, 0.9f, 0.5f);
             var burst = new SerializedObject(diver.AddComponent<BubbleBurstEmitter>());
-            burst.FindProperty("field").objectReferenceValue = demo.bubbles;
+            burst.FindProperty("field").objectReferenceValue = columns;
             burst.ApplyModifiedPropertiesWithoutUndo();
 
             demo.camera = new GameObject("Main Camera").AddComponent<Camera>();
@@ -224,12 +241,33 @@ namespace Nyx.GpuInstancing.Editor
 
             if (!string.IsNullOrEmpty(scenePath))
             {
+                // Les ajouts de comportement enregistrent un Undo, appliqué en fin de frame : l'appliquer avant d'enregistrer,
+                // sinon la scène repasse « modifiée » juste après la sauvegarde.
+                Undo.FlushUndoRecordObjects();
                 string folder = System.IO.Path.GetDirectoryName(scenePath)?.Replace('\\', '/');
                 if (!string.IsNullOrEmpty(folder) && !AssetDatabase.IsValidFolder(folder))
                     AssetDatabase.CreateFolder(System.IO.Path.GetDirectoryName(folder)?.Replace('\\', '/'), System.IO.Path.GetFileName(folder));
                 EditorSceneManager.SaveScene(demo.scene, scenePath);
             }
             return demo;
+        }
+
+        /// <summary>Objet avec MeshSpawner + comportement T et ses meshes par défaut (sans Undo : scène neuve).</summary>
+        static MeshSpawner AddSpawner<T>(string name, Vector3 position, out T behavior) where T : MeshSpawnerBehavior
+        {
+            var gameObject = new GameObject(name);
+            gameObject.transform.position = position;
+            var spawner = gameObject.AddComponent<MeshSpawner>();
+            behavior = gameObject.AddComponent<T>();
+            spawner.SetVariants(behavior.CreateDefaultVariants());
+            return spawner;
+        }
+
+        static void SetFloat(Object target, string property, float value)
+        {
+            var settings = new SerializedObject(target);
+            settings.FindProperty(property).floatValue = value;
+            settings.ApplyModifiedPropertiesWithoutUndo();
         }
     }
 }
