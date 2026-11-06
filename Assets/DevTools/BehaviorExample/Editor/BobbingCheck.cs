@@ -43,9 +43,11 @@ static class BobbingCheck
             MeshSpawner spawner = go.GetComponent<MeshSpawner>();
             spawner.SetVariants(NyxDefaultAssets.RockVariants());
             var settings = new SerializedObject(spawner);
-            settings.FindProperty("areaSize").vector2Value = new Vector2(20f, 20f);
             settings.FindProperty("densityPer100m2").floatValue = 10f;
             settings.ApplyModifiedPropertiesWithoutUndo();
+            // Le dandinement monte au-dessus de la face du haut, où se fait le placement : sans destruction par le volume
+            spawner.SetZone(Vector3.zero, MeshSpawner.RectanglePoints(new Vector2(20f, 20f)), 10f);
+            spawner.ClipToVolume = false;
             spawner.RebuildNow();
             lines.Add($"comportement actif : {spawner.Behavior == behavior}, instances : {spawner.InstanceCount}, draws : {spawner.DrawCallsPerCamera}");
 

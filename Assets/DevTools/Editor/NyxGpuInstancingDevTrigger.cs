@@ -16,13 +16,17 @@ using UnityEngine.SceneManagement;
 ///  - state.request   : écrit dans state.txt les scènes ouvertes et si elles ont des modifications non enregistrées ;
 ///  - invoke.request  : appelle la méthode statique « Type, Assembly|Méthode » écrite dans le fichier, résultat dans invoke.txt.
 /// Le test et la démo ne sont pas lancés si une scène ouverte a des modifications non enregistrées (sauf la scène de démo,
-/// qui est reconstruite).
+/// qui est reconstruite). Après un test (qui laisse sa propre scène ouverte), « NyxGpuInstancingDevTrigger,
+/// Assembly-CSharp-Editor|OpenDemoScene » dans invoke.request rouvre la scène de démo enregistrée.
 /// </summary>
 [InitializeOnLoad]
 static class NyxGpuInstancingDevTrigger
 {
     const string DemoScenePath = "Assets/NyxGpuInstancingDemo/NyxGpuInstancingDemo.unity";
     static double s_NextPoll;
+
+    /// <summary>Rouvre la scène de démo telle qu'enregistrée (invoke.request).</summary>
+    public static void OpenDemoScene() => UnityEditor.SceneManagement.EditorSceneManager.OpenScene(DemoScenePath);
 
     static string Folder => Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Logs", "NyxGpuInstancingTest"));
 
@@ -54,7 +58,9 @@ static class NyxGpuInstancingDevTrigger
             string[] target = File.ReadAllText(invoke).Trim().Split('|');
             File.Delete(invoke);
             Type type = Type.GetType(target[0]);
-            MethodInfo method = target.Length > 1 ? type?.GetMethod(target[1].Trim(), BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static) : null;
+            MethodInfo method = target.Length > 1   // surcharge sans paramètre (d'autres peuvent porter le même nom)
+                ? type?.GetMethod(target[1].Trim(), BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static, null, Type.EmptyTypes, null)
+                : null;
             string result;
             try
             {

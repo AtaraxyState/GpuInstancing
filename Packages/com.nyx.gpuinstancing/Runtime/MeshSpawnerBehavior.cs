@@ -29,7 +29,11 @@ namespace Nyx.GpuInstancing
     ///     </code>
     ///  2. une classe qui hérite de MeshSpawnerBehavior et donne le chemin de ce compute shader (CullingShaderResource).
     ///     Les autres méthodes sont facultatives : paramètres du shader, données par instance, bounds, instances propres.
-    ///     Les instances sont construites en mémoire native (NativeArray) ; par défaut par un job Burst.
+    ///
+    /// Les instances placées sont construites sur GPU (lacet + échelle + position, graine en custom.x). Pour des données
+    /// propres au comportement, les calculer de préférence dans NyxEvaluateInstance à partir de la graine (FloatOnWaves :
+    /// profondeur dans la couche d'algues). Surcharger CreateInstance(s) en C# reste possible mais plus lent : les
+    /// placements sont lus sur GPU, puis les instances écrites en C# sont envoyées.
     ///
     /// Données d'instance (64 octets) : row0..row2 = matrice 3x4 objet -> monde par défaut, custom.x = graine 0..1,
     /// custom.y/z = libres, custom.w = index de variante (ne pas modifier). Le compute shader écrit dans dst.custom
@@ -57,21 +61,25 @@ namespace Nyx.GpuInstancing
         public virtual bool UsesPlacement => true;
 
         /// <summary>
-        /// Donnée GPU d'une instance placée. Défaut : matrice position + lacet + échelle, graine en custom.x.
-        /// Surcharger pour y écrire des données propres au comportement (custom.y/z, ou une autre interprétation des lignes).
-        /// Simple mais en C# classique, une instance après l'autre : pour des centaines de milliers d'instances, surcharger
-        /// plutôt CreateInstances avec un job Burst.
+        /// Donnée GPU d'une instance placée, écrite en C#. Défaut : matrice position + lacet + échelle, graine en custom.x
+        /// (la même chose est construite sur GPU si ni CreateInstance ni CreateInstances ne sont surchargées).
+        /// Surcharger pour y écrire des données propres au comportement (custom.y/z, ou une autre interprétation des lignes) :
+        /// le placement est alors lu sur GPU et les instances envoyées, bien plus lent qu'un calcul dans le compute shader.
+        /// En C# classique, une instance après l'autre : pour des centaines de milliers d'instances, surcharger plutôt
+        /// CreateInstances avec un job Burst.
         /// </summary>
         public virtual GpuInstanceData CreateInstance(MeshPlacement placement) =>
             MeshSpawnerJobs.TrsInstance(placement.position, placement.yaw, placement.scale, placement.seed, placement.variant);
 
         /// <summary>
-        /// Toutes les instances d'un coup, en mémoire native (output a la taille de placements). Défaut : job Burst parallèle
-        /// (matrice position + lacet + échelle), ou CreateInstance pour chaque placement si le comportement le surcharge.
+        /// Toutes les instances d'un coup, en C#, en mémoire native (output a la taille de placements). Appelée seulement si
+        /// le comportement surcharge CreateInstance ou CreateInstances (ou si MeshSpawner.CreateInstancesOnGpu est faux).
+        /// Défaut : CreateInstance pour chaque placement s'il est surchargé, sinon job Burst parallèle (matrice position +
+        /// lacet + échelle).
         /// </summary>
         public virtual void CreateInstances(NativeArray<MeshPlacement> placements, NativeArray<GpuInstanceData> output)
         {
-            if (OverridesCreateInstance)
+            if (Overrides.single)
             {
                 for (int i = 0; i < placements.Length; i++)
                     output[i] = CreateInstance(placements[i]);
@@ -81,22 +89,28 @@ namespace Nyx.GpuInstancing
                 .Schedule(placements.Length, MeshSpawnerJobs.BatchSize).Complete();
         }
 
-        bool OverridesCreateInstance
+        /// <summary>Le comportement écrit ses instances placées en C# (surcharge de CreateInstance ou CreateInstances).</summary>
+        internal bool CreatesInstancesOnCpu => Overrides.any;
+
+        (bool single, bool any) Overrides
         {
             get
             {
                 Type type = GetType();
-                if (!s_OverridesCreateInstance.TryGetValue(type, out bool overrides))
+                if (!s_Overrides.TryGetValue(type, out (bool single, bool any) overrides))
                 {
-                    MethodInfo method = type.GetMethod(nameof(CreateInstance), new[] { typeof(MeshPlacement) });
-                    overrides = method != null && method.DeclaringType != typeof(MeshSpawnerBehavior);
-                    s_OverridesCreateInstance.Add(type, overrides);
+                    bool single = Declared(type.GetMethod(nameof(CreateInstance), new[] { typeof(MeshPlacement) }));
+                    bool all = Declared(type.GetMethod(nameof(CreateInstances), new[] { typeof(NativeArray<MeshPlacement>), typeof(NativeArray<GpuInstanceData>) }));
+                    overrides = (single, single || all);
+                    s_Overrides.Add(type, overrides);
                 }
                 return overrides;
             }
         }
 
-        static readonly Dictionary<Type, bool> s_OverridesCreateInstance = new Dictionary<Type, bool>();
+        static bool Declared(MethodInfo method) => method != null && method.DeclaringType != typeof(MeshSpawnerBehavior);
+
+        static readonly Dictionary<Type, (bool single, bool any)> s_Overrides = new Dictionary<Type, (bool single, bool any)>();
 
         /// <summary>
         /// Bounds monde couvrant toutes les positions possibles des instances (mouvement compris), pour le culling CPU
@@ -113,8 +127,20 @@ namespace Nyx.GpuInstancing
         public virtual int GetInstanceCount() => 0;
 
         /// <summary>
-        /// Pour UsesPlacement = false : remplit 'output' (taille GetInstanceCount(), mémoire native libérée après l'envoi au GPU)
-        /// et renvoie les bounds monde de toutes les positions possibles.
+        /// Pour UsesPlacement = false : écrit les instances directement dans le buffer GPU du spawner ('count' =
+        /// GetInstanceCount(), buffer d'au moins 1 élément), typiquement par un noyau de son compute shader lancé avec
+        /// MeshSpawner.DispatchInstances, et renvoie les bounds monde de toutes les positions possibles. Renvoie false pour
+        /// passer par BuildInstances (C#). Les variantes sont comptées sur GPU ensuite.
+        /// </summary>
+        public virtual bool BuildInstancesOnGpu(ComputeBuffer instances, int count, out Bounds bounds)
+        {
+            bounds = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Pour UsesPlacement = false, si BuildInstancesOnGpu renvoie false : remplit 'output' en C# (taille GetInstanceCount(),
+        /// mémoire native libérée après l'envoi au GPU) et renvoie les bounds monde de toutes les positions possibles.
         /// </summary>
         public virtual Bounds BuildInstances(NativeArray<GpuInstanceData> output) => new Bounds(transform.position, Vector3.zero);
 
@@ -123,6 +149,12 @@ namespace Nyx.GpuInstancing
 
         /// <summary>Marge (espace local du mesh) ajoutée aux bounds d'une variante pour couvrir la déformation du vertex shader.</summary>
         public virtual float GetBoundsPadding(InstanceVariant variant, Bounds localBounds, float defaultPadding) => defaultPadding;
+
+        /// <summary>
+        /// « Clip To Volume » donné au MeshSpawner quand ce comportement est ajouté dans l'éditeur. Faux pour un comportement
+        /// dont les instances sortent normalement de la zone (colonnes de bulles qui montent jusqu'à la surface).
+        /// </summary>
+        public virtual bool ClipToVolumeByDefault => true;
 
 #if UNITY_EDITOR
         /// <summary>Éditeur : variantes (meshes + matériau) données au MeshSpawner s'il n'en a pas encore. null = aucune.</summary>
@@ -142,7 +174,18 @@ namespace Nyx.GpuInstancing
             UnityEditor.EditorUtility.SetDirty(spawner);
         }
 
-        protected virtual void Reset() => ApplyDefaultVariants();
+        /// <summary>Ajout du comportement dans l'éditeur : meshes par défaut si le spawner n'en a pas, destruction par le volume selon le comportement.</summary>
+        protected virtual void Reset()
+        {
+            ApplyDefaultVariants();
+            MeshSpawner spawner = Spawner;
+            if (spawner != null && spawner.ClipToVolume != ClipToVolumeByDefault)
+            {
+                UnityEditor.Undo.RecordObject(spawner, "Volume de la zone");
+                spawner.ClipToVolume = ClipToVolumeByDefault;
+                UnityEditor.EditorUtility.SetDirty(spawner);
+            }
+        }
 #endif
 
         /// <summary>Reconstruction du spawner (après un changement de paramètre qui modifie les instances).</summary>

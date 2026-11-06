@@ -172,7 +172,6 @@ namespace Nyx.GpuInstancing.Editor
             // Sargasses : MeshSpawner + Float On Waves
             demo.sargassum = AddSpawner<FloatOnWaves>("Sargasses (Float On Waves)", Vector3.zero, out FloatOnWaves floating);
             var spawner = new SerializedObject(demo.sargassum);
-            spawner.FindProperty("areaSize").vector2Value = new Vector2(80f, 80f);
             spawner.FindProperty("densityPer100m2").floatValue = 6f;
             SerializedProperty anchors = spawner.FindProperty("clusterAnchors");
             anchors.arraySize = 2;
@@ -185,6 +184,15 @@ namespace Nyx.GpuInstancing.Editor
             var floatSettings = new SerializedObject(floating);
             floatSettings.FindProperty("layerThickness").floatValue = 0.4f;
             floatSettings.ApplyModifiedPropertiesWithoutUndo();
+            // Zone : polygone concave (encoche au nord) qui couvre la mine et le leurre, volume posé sur l'eau.
+            // Les touffes qui dérivent hors du polygone sont détruites.
+            demo.sargassum.SetZone(Vector3.zero, SargassumZone, 1f);
+            demo.sargassum.ClipToVolume = true;
+            demo.sargassum.ZoneSmooth = true;          // bord naturel : courbe par les 9 points, côte irrégulière, lisière clairsemée
+            demo.sargassum.ZoneEdgeNoise = 3f;
+            demo.sargassum.ZoneEdgeNoiseScale = 12f;
+            demo.sargassum.ZoneEdgeFeather = 5f;
+            floating.FitZoneToWater();
             demo.sargassum.RebuildNow();
 
             // Bulles : MeshSpawner + Bubble Columns
@@ -206,12 +214,14 @@ namespace Nyx.GpuInstancing.Editor
             bubbles.FindProperty("burstSettings").FindPropertyRelative("surfaceRadius").vector2Value = new Vector2(0.012f, 0.03f);
             bubbles.ApplyModifiedPropertiesWithoutUndo();
             SetFloat(demo.bubbles, "maxDrawDistance", 60f);
+            demo.bubbles.ClipToVolume = false;   // les colonnes montent jusqu'à la surface
             demo.bubbles.RebuildNow();
 
-            // Rochers sur le fond : MeshSpawner + Static Instances
+            // Rochers sur le fond : MeshSpawner + Static Instances, posés sur la face du haut d'un volume de 3 m
             demo.rocks = AddSpawner<StaticInstances>("Rochers (Static Instances)", new Vector3(0f, -12f, 0f), out _);
+            demo.rocks.SetZone(Vector3.zero, RockZone, 3f);
+            demo.rocks.ClipToVolume = true;
             var rocks = new SerializedObject(demo.rocks);
-            rocks.FindProperty("areaSize").vector2Value = new Vector2(70f, 70f);
             rocks.FindProperty("densityPer100m2").floatValue = 4f;
             rocks.FindProperty("scaleRange").vector2Value = new Vector2(0.6f, 2.2f);
             rocks.FindProperty("castShadows").enumValueIndex = (int)ShadowCastingMode.On;
@@ -251,6 +261,19 @@ namespace Nyx.GpuInstancing.Editor
             }
             return demo;
         }
+
+        /// <summary>Zone des sargasses (m, autour de l'objet) : concave, encoche au nord, mine (5, 10) et leurre (-12, 0) dedans.</summary>
+        internal static readonly Vector2[] SargassumZone =
+        {
+            new Vector2(-40f, -30f), new Vector2(-12f, -40f), new Vector2(22f, -36f), new Vector2(40f, -8f), new Vector2(36f, 28f),
+            new Vector2(6f, 40f), new Vector2(-4f, 18f), new Vector2(-26f, 36f), new Vector2(-41f, 6f)
+        };
+
+        /// <summary>Zone des rochers (m, autour de l'objet) : hexagone irrégulier sur le fond.</summary>
+        internal static readonly Vector2[] RockZone =
+        {
+            new Vector2(-35f, -20f), new Vector2(-10f, -36f), new Vector2(25f, -30f), new Vector2(35f, 5f), new Vector2(15f, 35f), new Vector2(-25f, 30f)
+        };
 
         /// <summary>Objet avec MeshSpawner + comportement T et ses meshes par défaut (sans Undo : scène neuve).</summary>
         static MeshSpawner AddSpawner<T>(string name, Vector3 position, out T behavior) where T : MeshSpawnerBehavior

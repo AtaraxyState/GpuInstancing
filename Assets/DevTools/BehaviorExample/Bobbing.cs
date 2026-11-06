@@ -9,6 +9,9 @@ public sealed class Bobbing : MeshSpawnerBehavior
 
     protected override string CullingShaderResource => "Bobbing";   // chemin dans Resources, sans extension
 
+    // Les instances montent au-dessus de la face du haut (où elles sont placées) : pas de destruction par le volume
+    public override bool ClipToVolumeByDefault => false;
+
     public override void SetShaderParameters(ComputeShader shader, Camera camera) =>
         shader.SetVector("_Bobbing", new Vector4(amplitude, speed, 0f, 0f));
 

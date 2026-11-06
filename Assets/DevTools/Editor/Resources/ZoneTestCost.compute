@@ -1,0 +1,99 @@
+// Outil de développement (ZoneTestCostExperiment.cs) : coût GPU du test « point dans la zone » pour N points répartis sur la boîte de la zone.
+//  - NyxEvenOdd    : polygone de N sommets (liste longue), règle pair-impair, sommets lus dans un buffer.
+//  - NyxNatural    : polygone de N sommets (peu de points de contrôle), distance signée + bruit fractal du bord.
+#pragma kernel NyxEvenOdd
+#pragma kernel NyxNatural
+
+#include "Packages/com.nyx.gpuinstancing/Shaders/ShaderLibrary/InstancingRandom.hlsl"
+
+StructuredBuffer<float2> _Vertices;
+RWStructuredBuffer<uint> _Result;
+uint   _VertexCount;
+uint   _Count;
+uint   _GroupsX;
+float4 _Bounds;        // min x, min z, max x, max z
+float4 _Noise;         // x : amplitude (m), y : 1 / longueur d'onde, z : octaves
+
+float2 PointOf(uint index)
+{
+    NyxRandom random = NyxCreateRandom(NyxHash2(uint2(77u, index)) | 1u);
+    return lerp(_Bounds.xy, _Bounds.zw, float2(NyxNextFloat(random), NyxNextFloat(random)));
+}
+
+float Hash01(int2 cell)
+{
+    uint h = NyxHash3(uint3(asuint(cell.x), asuint(cell.y), 911u));
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12;
+    return (h & 0xFFFFFFu) / 16777215.0;
+}
+
+float ValueNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 u = f * f * (3.0 - 2.0 * f);
+    int2 c = (int2)i;
+    float a = Hash01(c), b = Hash01(c + int2(1, 0)), d = Hash01(c + int2(0, 1)), e = Hash01(c + int2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(d, e, u.x), u.y) * 2.0 - 1.0;
+}
+
+float Fbm(float2 p, uint octaves)
+{
+    float sum = 0, amplitude = 0.5, norm = 0;
+    for (uint o = 0; o < octaves; o++)
+    {
+        sum += ValueNoise(p) * amplitude;
+        norm += amplitude;
+        amplitude *= 0.5;
+        p = p * 2.03 + 17.1;
+    }
+    return sum / norm;
+}
+
+[numthreads(64, 1, 1)]
+void NyxEvenOdd(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint index = (groupId.y * _GroupsX + groupId.x) * 64 + threadId.x;
+    if (index >= _Count)
+        return;
+    float2 p = PointOf(index);
+    bool inside = false;
+    float2 a = _Vertices[_VertexCount - 1];
+    for (uint i = 0; i < _VertexCount; i++)
+    {
+        float2 b = _Vertices[i];
+        if ((b.y > p.y) != (a.y > p.y) && p.x < (a.x - b.x) * (p.y - b.y) / (a.y - b.y) + b.x)
+            inside = !inside;
+        a = b;
+    }
+    _Result[index] = inside ? 1u : 0u;
+}
+
+[numthreads(64, 1, 1)]
+void NyxNatural(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint index = (groupId.y * _GroupsX + groupId.x) * 64 + threadId.x;
+    if (index >= _Count)
+        return;
+    float2 p = PointOf(index);
+    float2 first = _Vertices[0] - p;
+    float distanceSq = dot(first, first);
+    float sign = 1.0;
+    float2 vj = _Vertices[_VertexCount - 1];
+    for (uint i = 0; i < _VertexCount; i++)
+    {
+        float2 vi = _Vertices[i];
+        float2 e = vj - vi;
+        float2 w = p - vi;
+        float2 b = w - e * saturate(dot(w, e) / dot(e, e));
+        distanceSq = min(distanceSq, dot(b, b));
+        bool c0 = p.y >= vi.y, c1 = p.y < vj.y, c2 = e.x * w.y > e.y * w.x;
+        if ((c0 && c1 && c2) || (!c0 && !c1 && !c2))
+            sign = -sign;
+        vj = vi;
+    }
+    float edge = sign * sqrt(distanceSq);
+    if (_Noise.x > 0)
+        edge += _Noise.x * Fbm(p * _Noise.y, (uint)_Noise.z);
+    _Result[index] = edge <= 0 ? 1u : 0u;
+}

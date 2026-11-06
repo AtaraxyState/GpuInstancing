@@ -126,9 +126,12 @@ namespace Nyx.GpuInstancing.Editor
             foreach (string compute in new[] { "FloatOnWaves", "BubbleColumns", "StaticInstances" })
             {
                 var shader = Resources.Load<ComputeShader>("NyxGpuInstancing/" + compute);
-                CheckCompute(report, shader, "NyxGpuInstancing/" + compute);
+                CheckCompute(report, shader, "NyxGpuInstancing/" + compute, "NyxCull", "NyxWriteArgs");
                 computesFound &= shader != null;
             }
+            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/BubbleColumns"), "NyxGpuInstancing/BubbleColumns (construction)", "NyxBuildBubbles");
+            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/InstanceBuild"), "NyxGpuInstancing/InstanceBuild",
+                "NyxCountPlacements", "NyxScanGroups", "NyxWriteInstances", "NyxWritePlacements", "NyxCountVariants");
             if (sargassumShader == null || bubbleShader == null || litShader == null || !computesFound)
                 return;
 
@@ -324,6 +327,25 @@ namespace Nyx.GpuInstancing.Editor
             report.Check(shadowPixels > ImageSize * ImageSize / 1000, "Ombres : les touffes ombrent le plan récepteur",
                 $"{shadowPixels} px du récepteur assombris ({100.0 * shadowPixels / (ImageSize * ImageSize):F2} %)");
             SavePng(report, shadowed, "surface_ombres");
+
+            // Hors de la passe de profondeur : touffes toujours dessinées et projetant leur ombre, matériau d'origine intact
+            int queueBefore = sargassum.Variants[0].material.renderQueue;
+            sargassum.ExcludeFromDepthTexture = true;
+            sargassum.RebuildNow();
+            Render(surfaceCamera);
+            Texture2D depthless = Render(surfaceCamera);
+            sargassum.TryReadVisibleCounts(surfaceCamera, counts);
+            int visibleDepthless = Sum(counts);
+            int shadowPixelsDepthless = CountShadowedPixels(receiverNoShadow, depthless);
+            int tuftsWith = CountTuftPixels(shadowed);
+            int tuftsDepthless = CountTuftPixels(depthless);
+            report.Check(visibleDepthless >= visibleWithShadows * 0.95f && shadowPixelsDepthless > ImageSize * ImageSize / 1000
+                         && tuftsDepthless > tuftsWith * 0.7f && sargassum.Variants[0].material.renderQueue == queueBefore && queueBefore <= 2500,
+                "Hors de la passe de profondeur : touffes dessinées et ombre projetée, matériau d'origine intact",
+                $"{visibleDepthless} visibles ({visibleWithShadows} avant) ; ombre : {shadowPixelsDepthless} px ; touffes : {tuftsDepthless} px ({tuftsWith} avant) ; " +
+                $"file du matériau {sargassum.Variants[0].material.renderQueue}");
+            SavePng(report, depthless, "surface_hors_profondeur");
+            sargassum.ExcludeFromDepthTexture = false;
             Object.DestroyImmediate(receiver);
             shadowSettings.FindProperty("castShadows").enumValueIndex = (int)ShadowCastingMode.Off;
             shadowSettings.ApplyModifiedPropertiesWithoutUndo();
@@ -363,9 +385,31 @@ namespace Nyx.GpuInstancing.Editor
                 "Mémoire GPU : un seul jeu de buffers de culling pour toutes les caméras rendues l'une après l'autre",
                 $"sargasses {sargassum.CullingBufferSets}, bulles {bubbles.CullingBufferSets}, rochers {rocks.CullingBufferSets} (5 caméras du test)");
             int placementSize = System.Runtime.InteropServices.Marshal.SizeOf<MeshPlacement>();
-            report.Check(sargassum.CpuMemoryBytes == (long)sargassum.InstanceCount * placementSize && bubbles.CpuMemoryBytes == 0,
-                "Mémoire CPU : seuls les placements restent après la reconstruction (mémoire native)",
-                $"sargasses {sargassum.CpuMemoryBytes / 1024} Ko ({placementSize} o par instance), bulles {bubbles.CpuMemoryBytes} o");
+            sargassum.RebuildNow();
+            long sargassumBefore = sargassum.CpuMemoryBytes;
+            long rocksBefore = rocks.CpuMemoryBytes;
+            long bubblesBefore = bubbles.CpuMemoryBytes;
+            int placementsRead = sargassum.Placements.Count;
+            report.Check(sargassumBefore == 0 && rocksBefore == 0 && bubblesBefore == 0 && placementsRead == sargassum.InstanceCount
+                         && sargassum.CpuMemoryBytes == (long)placementsRead * placementSize && sargassum.LastUploadMethod == MeshSpawner.UploadMethod.BuiltOnGpu
+                         && rocks.LastUploadMethod == MeshSpawner.UploadMethod.BuiltOnGpu && bubbles.LastUploadMethod == MeshSpawner.UploadMethod.BuiltOnGpu,
+                "Mémoire CPU : rien n'est retenu après la reconstruction (instances construites sur GPU), placements lus à la demande",
+                $"après reconstruction : sargasses {sargassumBefore} o, rochers {rocksBefore} o, bulles {bubblesBefore} o ; " +
+                $"Placements : {placementsRead} lus ({sargassum.CpuMemoryBytes / 1024} Ko, {placementSize} o chacun) ; " +
+                $"origine : {sargassum.LastUploadMethod}, {rocks.LastUploadMethod}, {bubbles.LastUploadMethod}");
+
+            // ---------------------------------------------------------------- 14. Instances construites sur GPU / en C#
+            CheckCpuInstances(report);
+
+            // ---------------------------------------------------------------- 15. Zone : polygone extrudé
+            report.Check(sargassum.ClipToVolume && rocks.ClipToVolume && !bubbles.ClipToVolume && !sargassum.MotionExceedsVolumeHeight,
+                "Zone : volume actif pour les sargasses et les rochers, pas pour les bulles ; houle dans le volume des sargasses",
+                $"sargasses {sargassum.ClipToVolume}, rochers {rocks.ClipToVolume}, bulles {bubbles.ClipToVolume} ; " +
+                $"sommets : sargasses {sargassum.ZonePoints.Count}, rochers {rocks.ZonePoints.Count}");
+            CheckZonePlacement(report);
+            CheckNaturalZone(report);
+            CheckLongZoneList(report);
+            CheckZoneDestruction(report);
 
             Object.DestroyImmediate(surfaceCamera.gameObject);
             Object.DestroyImmediate(skyCamera.gameObject);
@@ -392,7 +436,7 @@ namespace Nyx.GpuInstancing.Editor
             report.Check(!ShaderUtil.ShaderHasError(shader) && errors.Count == 0, $"Shader {label} compile sans erreur", string.Join(" ; ", errors));
         }
 
-        static void CheckCompute(Report report, ComputeShader shader, string label)
+        static void CheckCompute(Report report, ComputeShader shader, string label, params string[] kernelNames)
         {
             if (shader == null)
             {
@@ -405,9 +449,325 @@ namespace Nyx.GpuInstancing.Editor
                 if (message.severity == ShaderCompilerMessageSeverity.Error)
                     errors.Add($"{message.message} ({message.file}:{message.line}, {message.platform})");
             }
-            bool kernels = errors.Count == 0 && shader.HasKernel("NyxCull") && shader.HasKernel("NyxWriteArgs");
-            report.Check(errors.Count == 0 && kernels, $"Compute {label} compile, noyaux NyxCull et NyxWriteArgs présents", string.Join(" ; ", errors));
+            bool kernels = errors.Count == 0 && Array.TrueForAll(kernelNames, shader.HasKernel);
+            report.Check(errors.Count == 0 && kernels, $"Compute {label} compile, noyaux {string.Join(" et ", kernelNames)} présents", string.Join(" ; ", errors));
         }
+
+        /// <summary>
+        /// Instances construites sur GPU identiques (au sinus près) à celles écrites en C# à partir des mêmes placements, lus
+        /// sur GPU (MeshSpawner.CreateInstancesOnGpu = false, envoi par SetData), deux fois de suite sur le même buffer.
+        /// Spawner temporaire, zone en étoile (placement filtré par le polygone).
+        /// </summary>
+        static void CheckCpuInstances(Report report)
+        {
+            var go = new GameObject("Instances en C# (test)");
+            go.transform.position = new Vector3(5000f, -50f, 5000f);
+            var spawner = go.AddComponent<MeshSpawner>();
+            go.AddComponent<StaticInstances>();
+            spawner.SetVariants(NyxDefaultAssets.RockVariants());
+            var settings = new SerializedObject(spawner);
+            settings.FindProperty("densityPer100m2").floatValue = 600f;   // ~52 000 candidats sur la boîte, ~27 000 dans l'étoile
+            settings.ApplyModifiedPropertiesWithoutUndo();
+            var star = new List<Vector2>();
+            for (int i = 0; i < 12; i++)
+            {
+                float angle = i * Mathf.PI * 2f / 12f;
+                star.Add(new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * (i % 2 == 0 ? 50f : 30f));
+            }
+            spawner.SetZone(Vector3.zero, star, 10f);
+            try
+            {
+                spawner.RebuildNow();
+                MeshSpawner.UploadMethod gpu = spawner.LastUploadMethod;
+                var onGpu = new GpuInstanceData[spawner.InstanceCount];
+                spawner.TryReadInstances(onGpu);
+
+                MeshSpawner.CreateInstancesOnGpu = false;
+                spawner.RebuildNow();
+                MeshSpawner.UploadMethod first = spawner.LastUploadMethod;
+                var expected = new GpuInstanceData[spawner.InstanceCount];
+                spawner.TryReadInstances(expected);
+                spawner.RebuildNow();
+                var again = new GpuInstanceData[spawner.InstanceCount];
+                spawner.TryReadInstances(again);
+
+                float worst = 0f;
+                int otherVariant = 0;
+                int mismatches = 0;
+                bool sameCount = onGpu.Length == expected.Length && again.Length == expected.Length;
+                for (int i = 0; sameCount && i < expected.Length; i++)
+                {
+                    for (int k = 0; k < 4; k++)
+                    {
+                        worst = Mathf.Max(worst, Mathf.Abs(onGpu[i].row0[k] - expected[i].row0[k]));
+                        worst = Mathf.Max(worst, Mathf.Abs(onGpu[i].row1[k] - expected[i].row1[k]));
+                        worst = Mathf.Max(worst, Mathf.Abs(onGpu[i].row2[k] - expected[i].row2[k]));
+                    }
+                    worst = Mathf.Max(worst, Mathf.Abs(onGpu[i].custom.x - expected[i].custom.x));
+                    if (onGpu[i].custom.w != expected[i].custom.w)
+                        otherVariant++;
+                    if (!Same(again[i], expected[i]))
+                        mismatches++;
+                }
+                report.Check(gpu == MeshSpawner.UploadMethod.BuiltOnGpu && first == MeshSpawner.UploadMethod.SetData && sameCount
+                             && expected.Length > 25000 && expected.Length < 29000 && worst < 1e-4f && otherVariant == 0 && mismatches == 0,
+                    "Construction sur GPU : instances identiques à celles écrites en C# depuis les mêmes placements (zone en étoile)",
+                    $"{onGpu.Length} sur GPU ({gpu}), {expected.Length} en C# ({first}) ; écart max {worst:G3} ; variantes différentes : {otherVariant} ; " +
+                    $"2e envoi C# : {mismatches} différence(s)");
+            }
+            finally
+            {
+                MeshSpawner.CreateInstancesOnGpu = true;
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        /// <summary>
+        /// Placement dans un polygone concave (L de 40 m, grille alignée sur ses bords : exactement 1 200 instances à
+        /// 100 / 100 m²), amas d'une ancre hors zone retirés seulement avec le volume, ancienne zone rectangulaire reprise.
+        /// </summary>
+        static void CheckZonePlacement(Report report)
+        {
+            var root = new Vector3(6000f, -50f, 6000f);
+            var go = new GameObject("Zone (test)");
+            go.transform.position = root;
+            var spawner = go.AddComponent<MeshSpawner>();
+            go.AddComponent<StaticInstances>();
+            spawner.SetVariants(NyxDefaultAssets.RockVariants());
+            var anchor = new GameObject("Ancre hors zone (test)").transform;
+            anchor.position = root + new Vector3(60f, 0f, 0f);
+            var settings = new SerializedObject(spawner);
+            settings.FindProperty("densityPer100m2").floatValue = 100f;
+            SerializedProperty anchors = settings.FindProperty("clusterAnchors");
+            anchors.arraySize = 1;
+            anchors.GetArrayElementAtIndex(0).objectReferenceValue = anchor;
+            settings.FindProperty("clusterRadius").floatValue = 3f;
+            settings.FindProperty("clumpsPerCluster").intValue = 20;
+            settings.ApplyModifiedPropertiesWithoutUndo();
+            try
+            {
+                Vector2[] lShape =
+                {
+                    new Vector2(-20f, -20f), new Vector2(20f, -20f), new Vector2(20f, 0f), new Vector2(0f, 0f), new Vector2(0f, 20f), new Vector2(-20f, 20f)
+                };
+                spawner.SetZone(Vector3.zero, lShape, 5f);
+                spawner.ClipToVolume = true;
+                spawner.RebuildNow();
+                int clipped = spawner.Placements.Count;
+                int outside = 0;
+                int inNotch = 0;
+                foreach (MeshPlacement placement in spawner.Placements)
+                {
+                    if (!spawner.VolumeContains(placement.position))
+                        outside++;
+                    if (placement.position.x > root.x && placement.position.z > root.z)
+                        inNotch++;
+                }
+                spawner.ClipToVolume = false;
+                spawner.RebuildNow();
+                int unclipped = spawner.Placements.Count;
+                report.Check(clipped == 1200 && outside == 0 && inNotch == 0 && unclipped == clipped + 20,
+                    "Zone : placement dans un polygone concave ; amas d'une ancre hors zone retirés avec le volume, gardés sans",
+                    $"{clipped} instances (1 200 attendues), {outside} hors du volume, {inNotch} dans l'encoche ; sans volume : {unclipped} (+ 20 amas)");
+
+                // Spawner enregistré avant la zone : pas de sommets, rectangle de l'ancienne taille
+                settings.Update();
+                settings.FindProperty("zonePoints").arraySize = 0;
+                settings.FindProperty("areaSize").vector2Value = new Vector2(10f, 10f);
+                settings.FindProperty("clusterAnchors").arraySize = 0;
+                settings.ApplyModifiedPropertiesWithoutUndo();
+                spawner.RebuildNow();
+                report.Check(spawner.ZonePoints.Count == 4 && spawner.InstanceCount == 100,
+                    "Zone : un spawner sans sommets (enregistré avant la zone) garde son rectangle",
+                    $"{spawner.ZonePoints.Count} sommets, {spawner.InstanceCount} instances (100 attendues pour 10 x 10 m)");
+            }
+            finally
+            {
+                Object.DestroyImmediate(anchor.gameObject);
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        /// <summary>Longue liste de sommets (1 024, cercle de 20 m à 1 / m², volume actif) : placée sur GPU, d'accord avec VolumeContains.</summary>
+        static void CheckLongZoneList(Report report)
+        {
+            var go = new GameObject("Longue liste de sommets (test)");
+            go.transform.position = new Vector3(6600f, -50f, 6600f);
+            var spawner = go.AddComponent<MeshSpawner>();
+            go.AddComponent<StaticInstances>();
+            spawner.SetVariants(NyxDefaultAssets.RockVariants());
+            SetFloat(spawner, "densityPer100m2", 100f);
+            var circle = new List<Vector2>();
+            for (int i = 0; i < 1024; i++)
+                circle.Add(new Vector2(Mathf.Cos(i * Mathf.PI * 2f / 1024f), Mathf.Sin(i * Mathf.PI * 2f / 1024f)) * 20f);
+            try
+            {
+                spawner.SetZone(Vector3.zero, circle, 5f);
+                spawner.ClipToVolume = true;
+                spawner.RebuildNow();
+                int disagree = 0;
+                foreach (MeshPlacement placement in spawner.Placements)
+                {
+                    if (!spawner.VolumeContains(placement.position))
+                        disagree++;
+                }
+                float expected = Mathf.PI * 400f;
+                report.Check(spawner.ZonePoints.Count == 1024 && Mathf.Abs(spawner.InstanceCount - expected) < expected * 0.05f && disagree == 0,
+                    "Zone : longue liste de sommets (1 024) placée sur GPU, d'accord avec VolumeContains",
+                    $"{spawner.ZonePoints.Count} sommets, {spawner.InstanceCount} instances ({expected:F0} attendues à 5 % près), {disagree} en désaccord");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        /// <summary>
+        /// Bord naturel : hexagone de 30 m à 1 / m², volume actif. Contour courbe, puis bruit du bord (± 4 m), puis lisière
+        /// (6 m). Placement GPU d'accord avec VolumeContains (C#), contour réellement changé, densité réduite par la lisière,
+        /// placement reproductible.
+        /// </summary>
+        static void CheckNaturalZone(Report report)
+        {
+            var root = new Vector3(6400f, -50f, 6400f);
+            var go = new GameObject("Bord naturel (test)");
+            go.transform.position = root;
+            var spawner = go.AddComponent<MeshSpawner>();
+            go.AddComponent<StaticInstances>();
+            spawner.SetVariants(NyxDefaultAssets.RockVariants());
+            SetFloat(spawner, "densityPer100m2", 100f);
+            var hexagon = new List<Vector2>();
+            for (int i = 0; i < 6; i++)
+                hexagon.Add(new Vector2(Mathf.Cos(i * Mathf.PI / 3f), Mathf.Sin(i * Mathf.PI / 3f)) * 30f);
+            try
+            {
+                spawner.SetZone(Vector3.zero, hexagon, 5f);
+                spawner.ClipToVolume = true;
+                spawner.RebuildNow();
+                int plain = spawner.InstanceCount;
+
+                spawner.ZoneSmooth = true;
+                spawner.RebuildNow();
+                int smooth = spawner.InstanceCount;
+                List<Vector2> outline = spawner.WorldOutline();
+
+                spawner.ZoneEdgeNoise = 4f;
+                spawner.ZoneEdgeNoiseScale = 10f;
+                spawner.RebuildNow();
+                int noisy = spawner.InstanceCount;
+                int disagree = 0, bulging = 0;
+                foreach (MeshPlacement placement in spawner.Placements)
+                {
+                    if (!spawner.VolumeContains(placement.position))
+                        disagree++;
+                    var xz = new Vector2(placement.position.x, placement.position.z);
+                    if (ZoneShape.Edge(xz, outline, 0f, 1f, false, Vector2.zero, 0u) > 0f)
+                        bulging++;   // hors de la courbe : le bruit a poussé le bord vers l'extérieur
+                }
+
+                spawner.ZoneEdgeFeather = 6f;
+                spawner.RebuildNow();
+                int feathered = spawner.InstanceCount;
+                spawner.RebuildNow();
+                int again = spawner.InstanceCount;
+
+                // La courbe passe par les coins de l'hexagone : elle s'arrondit vers le cercle qui les relie (pi × 30² m²)
+                report.Check(smooth > plain && smooth < Mathf.PI * 900f * 1.03f && outline.Count > 6 && disagree <= noisy / 1000 && bulging > 0
+                             && noisy != smooth && feathered < noisy * 0.95f && feathered > noisy * 0.5f && again == feathered,
+                    "Zone : bord naturel (courbe, bruit du bord, lisière) placé sur GPU, d'accord avec VolumeContains",
+                    $"hexagone {plain} ; courbe ({outline.Count} sommets) {smooth} ; + bruit ± 4 m {noisy} (dont {bulging} hors de la courbe, " +
+                    $"{disagree} en désaccord avec le C#) ; + lisière 6 m {feathered} (reconstruit : {again})");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        /// <summary>
+        /// Destruction sur GPU : Float On Waves dont la face du haut est au niveau de l'eau, les crêtes en sortent. Les touffes
+        /// détruites le restent aux images suivantes, toutes reviennent à la reconstruction, aucune sans le volume.
+        /// </summary>
+        static void CheckZoneDestruction(Report report)
+        {
+            float water = OceanWaves.WaterLevel;
+            var root = new Vector3(6200f, water, 6200f);
+            var go = new GameObject("Destruction par le volume (test)");
+            go.transform.position = root;
+            var spawner = go.AddComponent<MeshSpawner>();
+            go.AddComponent<FloatOnWaves>();
+            spawner.SetVariants(NyxDefaultAssets.SargassumVariants());
+            SetFloat(spawner, "densityPer100m2", 100f);
+            Camera camera = MakeCamera("Caméra destruction (test)", root + new Vector3(0f, 8f, -18f), root, Color.black, 60f);
+            try
+            {
+                spawner.SetZone(Vector3.zero, MeshSpawner.RectanglePoints(new Vector2(20f, 20f)), 5f);
+                spawner.ClipToVolume = true;
+                spawner.RebuildNow();
+                bool warned = spawner.MotionExceedsVolumeHeight;
+                int deadVariant = spawner.Variants.Count;
+                var data = new GpuInstanceData[spawner.InstanceCount];
+
+                Render(camera, readBack: false);
+                spawner.TryReadInstances(data);
+                var firstDead = new List<int>();
+                for (int i = 0; i < data.Length; i++)
+                {
+                    if ((int)data[i].custom.w == deadVariant)
+                        firstDead.Add(i);
+                }
+                Thread.Sleep(300);   // les vagues avancent
+                Render(camera, readBack: false);
+                Render(camera, readBack: false);
+                spawner.TryReadInstances(data);
+                int stillDead = 0;
+                int deadLater = 0;
+                foreach (int i in firstDead)
+                {
+                    if ((int)data[i].custom.w == deadVariant)
+                        stillDead++;
+                }
+                foreach (GpuInstanceData instance in data)
+                {
+                    if ((int)instance.custom.w == deadVariant)
+                        deadLater++;
+                }
+
+                spawner.RebuildNow();
+                spawner.TryReadInstances(data);
+                int deadAfterRebuild = CountVariant(data, deadVariant);
+                spawner.ClipToVolume = false;
+                spawner.RebuildNow();
+                Render(camera, readBack: false);
+                spawner.TryReadInstances(data);
+                int deadWithoutVolume = CountVariant(data, deadVariant);
+
+                report.Check(warned && firstDead.Count > 0 && firstDead.Count < data.Length && stillDead == firstDead.Count
+                             && deadLater >= firstDead.Count && deadAfterRebuild == 0 && deadWithoutVolume == 0,
+                    "Zone : touffes sorties du volume détruites définitivement (jusqu'à la reconstruction), aucune sans le volume",
+                    $"{data.Length} touffes ; détruites : {firstDead.Count} au 1er rendu, {deadLater} ensuite (dont {stillDead} des premières) ; " +
+                    $"après reconstruction {deadAfterRebuild} ; sans volume {deadWithoutVolume} ; avertissement houle : {warned}");
+            }
+            finally
+            {
+                Object.DestroyImmediate(camera.gameObject);
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        static int CountVariant(GpuInstanceData[] instances, int variant)
+        {
+            int count = 0;
+            foreach (GpuInstanceData instance in instances)
+            {
+                if ((int)instance.custom.w == variant)
+                    count++;
+            }
+            return count;
+        }
+
+        static bool Same(GpuInstanceData a, GpuInstanceData b) =>
+            a.row0.Equals(b.row0) && a.row1.Equals(b.row1) && a.row2.Equals(b.row2) && a.custom.Equals(b.custom);
 
         static void SetFloat(Object target, string property, float value)
         {
@@ -489,6 +849,18 @@ namespace Nyx.GpuInstancing.Editor
                     shadowed++;
             }
             return shadowed;
+        }
+
+        /// <summary>Pixels bruns des touffes (R nettement plus grand que B).</summary>
+        static int CountTuftPixels(Texture2D image)
+        {
+            int count = 0;
+            foreach (Color32 pixel in image.GetPixels32())
+            {
+                if (pixel.r > pixel.b + 8)
+                    count++;
+            }
+            return count;
         }
 
         static void SavePng(Report report, Texture2D image, string name)

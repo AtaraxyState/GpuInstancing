@@ -50,10 +50,11 @@ static class MeshSpawnerMemoryBenchmark
         go.AddComponent(behaviorType);
         spawner.SetVariants(variants);
         var settings = new SerializedObject(spawner);
-        settings.FindProperty("areaSize").vector2Value = new Vector2(1000f, 1000f);
         settings.FindProperty("densityPer100m2").floatValue = 100f;
         settings.FindProperty("maxDrawDistance").floatValue = 2000f;
         settings.ApplyModifiedPropertiesWithoutUndo();
+        spawner.SetZone(Vector3.zero, MeshSpawner.RectanglePoints(new Vector2(1000f, 1000f)), 10f);
+        spawner.ClipToVolume = false;
 
         GC.Collect();
         long managedBefore = GC.GetTotalMemory(true);

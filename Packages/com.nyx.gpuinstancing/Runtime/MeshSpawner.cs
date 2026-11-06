@@ -5,6 +5,7 @@ using System.Text;
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.XR;
@@ -35,17 +36,24 @@ namespace Nyx.GpuInstancing
     /// Le MeshSpawner gère le reste : meshes et LODs, placement (zone, amas, liste), culling (frustum des deux yeux,
     /// distance, petits objets), buffers, VR, ombres.
     ///
+    /// Construction (MeshSpawnerGpuBuild.cs) : sur GPU, par compute shader. Placement (grille, amas, liste), filtrage par la
+    /// zone et données d'instance sont écrits directement dans le buffer d'instances ; le CPU ne prépare que quelques
+    /// paramètres et lit quelques compteurs (taille des buffers, boîte des positions). Un comportement qui écrit ses
+    /// instances en C# reçoit les placements lus sur GPU, et ses instances sont envoyées ensuite.
+    ///
     /// Mémoire :
-    ///  - CPU : construction dans des NativeArray par des jobs Burst, libérées dès l'envoi au GPU. Seuls les placements
-    ///    restent (28 octets par instance, mémoire native) ; rien de proportionnel au nombre d'instances dans le tas managé.
+    ///  - CPU : rien de proportionnel au nombre d'instances n'est retenu. Les placements ne sont lus (28 o chacun, mémoire
+    ///    native) qu'à la demande (Placements, figer le placement) ou pour un comportement qui écrit ses instances en C#.
     ///  - GPU : instances (64 o chacune) + un jeu de buffers de culling partagé par les caméras rendues l'une après
     ///    l'autre (visibles × 64 o + index par draw × 4 o). Une caméra rendue PENDANT le rendu d'une autre (réflexion
-    ///    d'eau) prend un second jeu : les draws de la première gardent leurs données.
+    ///    d'eau) prend un second jeu : les draws de la première gardent leurs données. Pendant la reconstruction seulement :
+    ///    masque des candidats (1 bit chacun) et, pour une liste, ses placements (28 o chacun).
+    ///  - Instances écrites en C# : N × 64 o en mémoire native le temps de l'envoi (ComputeBuffer.SetData).
     /// </summary>
     [ExecuteAlways]
     [DisallowMultipleComponent]
     [AddComponentMenu("Nyx/GPU Instancing/Mesh Spawner")]
-    public sealed class MeshSpawner : MonoBehaviour
+    public sealed partial class MeshSpawner : MonoBehaviour
     {
         public enum PlacementSource
         {
@@ -55,6 +63,16 @@ namespace Nyx.GpuInstancing
             List
         }
 
+        /// <summary>Origine des instances d'une reconstruction (diagnostic).</summary>
+        public enum UploadMethod
+        {
+            None,
+            /// <summary>Écrites en C# (comportement qui surcharge CreateInstance(s) ou BuildInstances), envoyées par ComputeBuffer.SetData.</summary>
+            SetData,
+            /// <summary>Construites sur GPU, directement dans le buffer d'instances : rien n'est envoyé.</summary>
+            BuiltOnGpu
+        }
+
         public const int MaxLods = 4;
         public const int MaxBuckets = 64;           // = NYX_MAX_BUCKETS (InstancingCulling.hlsl)
         const int ThreadGroupSize = 64;             // = NYX_THREADS
@@ -62,16 +80,52 @@ namespace Nyx.GpuInstancing
         const int ArgsPerDraw = 5;
         const int MaxGeneratedInstances = 2_000_000;
 
+        /// <summary>
+        /// Sommets maximum du polygone de la zone. Le test de la zone (placement, et à chaque image avec Clip To Volume) coûte
+        /// en proportion du nombre de sommets : 64 sommets 0,7 ms, 1 024 sommets 8 ms pour 1 000 000 d'instances (GTX 1060).
+        /// Pour un contour naturel, préférer quelques points + ZoneSmooth / ZoneEdgeNoise / ZoneEdgeFeather.
+        /// </summary>
+        public const int MaxZonePoints = 4096;
+
+        /// <summary>Sommets du contour courbe (ZoneSmooth) : chaque segment est découpé jusqu'à ce total.</summary>
+        public const int SmoothZonePoints = 64;
+        const float ZoneHeightTolerance = 1e-3f;   // une instance posée sur la face du haut est dedans
+
         [Header("Meshes")]
         [Tooltip("Variantes : 1 à 4 meshes (LOD0 en premier), distances de LOD, matériau compatible avec le comportement.")]
         [SerializeField] List<InstanceVariant> variants = new List<InstanceVariant>();
+
+        [Header("Zone : polygone extrudé vers le bas")]
+        [Tooltip("Centre de la face du haut, par rapport à la position de cet objet (axes du monde). Le placement se fait à cette hauteur.")]
+        [SerializeField] Vector3 zoneCenter;
+        [Tooltip("Sommets de la face du haut (X, Z en m) par rapport au centre, dans l'ordre du contour. Concave possible, " +
+                 "3 à 64 sommets. Moins de 3 : rectangle de l'ancienne taille de zone.")]
+        [SerializeField] List<Vector2> zonePoints = new List<Vector2>();
+        [Tooltip("Profondeur du volume sous la face du haut (m).")]
+        [SerializeField, Min(0f)] float zoneDepth = 10f;
+        [Tooltip("Détruire les instances qui sortent du volume : hors du volume au placement, elles ne sont pas créées ; " +
+                 "en mouvement, une instance vue hors du volume est détruite jusqu'à la prochaine reconstruction.")]
+        [SerializeField] bool clipToVolume;   // false pour les spawners enregistrés avant la zone ; Reset() met true
+
+        [Header("Zone : bord naturel")]
+        [Tooltip("Contour courbe : les sommets sont reliés par une courbe qui passe par chacun d'eux (Catmull-Rom centripète), " +
+                 "au lieu de segments droits. Quelques points suffisent pour une forme naturelle.")]
+        [SerializeField] bool zoneSmooth;
+        [Tooltip("Irrégularité du bord (m) : le contour est déplacé jusqu'à ± cette distance par un bruit fractal, comme une côte. " +
+                 "0 = contour exact. Coût GPU : celui d'un polygone de 64 sommets, quel que soit le nombre de détails.")]
+        [SerializeField, Min(0f)] float zoneEdgeNoise;
+        [Tooltip("Taille des irrégularités du bord (m).")]
+        [SerializeField, Min(0.5f)] float zoneEdgeNoiseScale = 15f;
+        [Tooltip("Lisière (m) : la densité du placement baisse jusqu'à zéro sur cette distance avant le bord : bord clairsemé " +
+                 "plutôt que coupé net. 0 = bord net.")]
+        [SerializeField, Min(0f)] float zoneEdgeFeather;
 
         [Header("Placement (si le comportement l'utilise)")]
         [SerializeField] PlacementSource source = PlacementSource.Procedural;
         [SerializeField] List<MeshPlacement> placements = new List<MeshPlacement>();
         [SerializeField] int randomSeed = 1234;
-        [Tooltip("Zone rectangulaire (m) centrée sur cet objet, à sa hauteur.")]
-        [SerializeField] Vector2 areaSize = new Vector2(200f, 200f);
+        [Tooltip("Ancienne zone rectangulaire, centrée sur l'objet : remplacée par le polygone de la zone (migration).")]
+        [SerializeField, HideInInspector] Vector2 areaSize = new Vector2(200f, 200f);
         [Tooltip("Instances pour 100 m², sur une grille perturbée (couverture régulière, sans amas ni trous).")]
         [SerializeField, Min(0f)] float densityPer100m2 = 2f;
         [SerializeField] Vector2 scaleRange = new Vector2(0.7f, 1.4f);
@@ -85,6 +139,12 @@ namespace Nyx.GpuInstancing
         [SerializeField] int renderLayer;
         [SerializeField] ShadowCastingMode castShadows = ShadowCastingMode.Off;
         [SerializeField] bool receiveShadows = true;
+        [Tooltip("Ne pas dessiner les instances dans la texture de profondeur de la caméra, que Unity remplit avant l'image dès que " +
+                 "le soleil projette des ombres. Pour un grand champ de végétation alpha-testée, cette passe coûte presque autant que " +
+                 "l'image (démo : 12,6 -> 8,6 ms GPU). En contrepartie, les instances ne reçoivent plus d'ombres, et les effets qui " +
+                 "lisent la profondeur (ombres en espace écran, profondeur de champ, eau qui lit la profondeur) ne les voient plus. " +
+                 "Les matériaux sont dessinés par des copies dont la file de rendu passe au-dessus de 2500 ; les assets ne changent pas.")]
+        [SerializeField] bool excludeFromDepthTexture;
 
         [Header("Culling GPU")]
         [Tooltip("Distance max d'affichage (m). Sous l'eau, inutile de dépasser la visibilité du brouillard.")]
@@ -138,20 +198,29 @@ namespace Nyx.GpuInstancing
             public bool skippedLastRender;       // diagnostic : spawner rejeté en entier côté CPU au dernier rendu
         }
 
-        /// <summary>Vue en lecture seule des placements (mémoire native du spawner), sans copie.</summary>
+        /// <summary>Vue en lecture seule des placements (lus sur GPU à la première demande, mémoire native du spawner), sans copie.</summary>
         sealed class PlacementList : IReadOnlyList<MeshPlacement>
         {
             readonly MeshSpawner _owner;
 
             public PlacementList(MeshSpawner owner) => _owner = owner;
 
-            public int Count => _owner._placements.IsCreated ? _owner._placements.Length : 0;
+            public int Count
+            {
+                get
+                {
+                    NativeArray<MeshPlacement> placements = _owner.EnsurePlacements();
+                    return placements.IsCreated ? placements.Length : 0;
+                }
+            }
 
-            public MeshPlacement this[int index] => _owner._placements[index];
+            public MeshPlacement this[int index] => _owner.EnsurePlacements()[index];
 
             public IEnumerator<MeshPlacement> GetEnumerator()
             {
-                for (int i = 0; i < Count; i++)
+                NativeArray<MeshPlacement> placements = _owner.EnsurePlacements();
+                int count = placements.IsCreated ? placements.Length : 0;
+                for (int i = 0; i < count; i++)
                     yield return _owner._placements[i];
             }
 
@@ -191,6 +260,18 @@ namespace Nyx.GpuInstancing
         readonly List<Camera> _deadCameras = new List<Camera>();
         readonly Vector4[] _planes = new Vector4[12];
         readonly List<Vector3> _anchorPositions = new List<Vector3>();
+        readonly Dictionary<Material, Material> _depthlessMaterials = new Dictionary<Material, Material>();   // original -> copie hors profondeur
+
+        // --- Volume de la zone, figé à la reconstruction (placement, destruction sur GPU, bounds) ---
+        ComputeBuffer _zoneVertexBuffer;   // sommets monde (x, z) ; 1 élément vide sans destruction par le volume
+        int _zonePointCountGpu;       // 0 = pas de destruction par le volume
+        Vector4 _zoneBoundsGpu;       // min x, min z, max x, max z
+        Vector2 _zoneHeightGpu;       // bas, haut (monde, tolérance comprise)
+        Vector4 _zoneNaturalGpu;      // bord naturel : amplitude, 1 / taille, (lisière : 0 pour la destruction)
+        Vector4 _zoneOriginGpu;       // centre (x, z) et graine du bruit
+        Bounds? _zoneDrawBounds;      // volume agrandi de la taille des meshes : limite les bounds du draw
+        int _deadVariant;             // index de la variante désactivée (= nombre de variantes à la reconstruction)
+
 
         // ------------------------------------------------------------------------------------------
         // API
@@ -215,11 +296,17 @@ namespace Nyx.GpuInstancing
             }
         }
 
-        /// <summary>Mémoire native CPU retenue entre deux reconstructions : les placements (octets).</summary>
+        /// <summary>
+        /// Mémoire native CPU retenue entre deux reconstructions (octets) : les placements, seulement s'ils ont été lus
+        /// (Placements) ou fournis à un comportement qui écrit ses instances en C#. 0 sinon.
+        /// </summary>
         public long CpuMemoryBytes => _placements.IsCreated ? (long)_placements.Length * System.Runtime.InteropServices.Marshal.SizeOf<MeshPlacement>() : 0L;
 
         /// <summary>Jeux de buffers de culling alloués (1 tant qu'aucune caméra n'est rendue pendant le rendu d'une autre).</summary>
         public int CullingBufferSets => _allBuffers.Count;
+
+        /// <summary>Origine des instances de la dernière reconstruction : construites sur GPU, ou écrites en C# et envoyées (diagnostic).</summary>
+        public UploadMethod LastUploadMethod { get; private set; }
 
         /// <summary>
         /// Temps commun au culling GPU, aux vagues et aux émissions (s). Time.time ne repart pas de zéro
@@ -233,8 +320,10 @@ namespace Nyx.GpuInstancing
         public IReadOnlyList<InstanceVariant> Variants => variants;
 
         /// <summary>
-        /// Placements de la dernière reconstruction (vide si le comportement fournit ses propres instances). Lus sans copie
-        /// dans la mémoire native du spawner : valables jusqu'à la prochaine reconstruction.
+        /// Placements de la dernière reconstruction (vide si le comportement fournit ses propres instances). Construits sur
+        /// GPU : à la première lecture après une reconstruction, le GPU refait le placement et le CPU le lit (bloquant,
+        /// 28 o par instance gardés en mémoire native jusqu'à la prochaine reconstruction). Pour un placement en liste, la
+        /// liste est relue telle qu'elle est au moment de la lecture.
         /// </summary>
         public IReadOnlyList<MeshPlacement> Placements => _placementList ??= new PlacementList(this);
 
@@ -259,6 +348,160 @@ namespace Nyx.GpuInstancing
 
         /// <summary>Reconstruction immédiate (tests, création par code). Jamais pendant un rendu : préférer SetDirty().</summary>
         public void RebuildNow() => Rebuild();
+
+        /// <summary>Centre monde de la face du haut de la zone (position de l'objet + décalage).</summary>
+        public Vector3 ZoneCenter => transform.position + zoneCenter;
+
+        /// <summary>Décalage du centre de la face du haut par rapport à l'objet.</summary>
+        public Vector3 ZoneCenterOffset => zoneCenter;
+
+        /// <summary>
+        /// Sommets de la face du haut (X, Z) par rapport au centre. Avec moins de 3 sommets enregistrés (spawner antérieur à
+        /// la zone), rectangle de l'ancienne taille de zone : même placement qu'avant.
+        /// </summary>
+        public IReadOnlyList<Vector2> ZonePoints => zonePoints.Count >= 3 ? zonePoints : RectanglePoints(areaSize);
+
+        /// <summary>Profondeur du volume sous la face du haut (m).</summary>
+        public float ZoneDepth => zoneDepth;
+
+        /// <summary>
+        /// Contour effectif de la face du haut (X, Z) par rapport au centre : les sommets, ou la courbe qui passe par eux avec
+        /// ZoneSmooth (SmoothZonePoints sommets environ). C'est le polygone du placement et de la destruction, avant le bruit du bord.
+        /// </summary>
+        public IReadOnlyList<Vector2> ZoneOutline => zoneSmooth ? ZoneShape.Smooth(ZonePoints, SmoothZonePoints) : ZonePoints;
+
+        /// <summary>Contour courbe passant par les sommets (voir ZoneOutline).</summary>
+        public bool ZoneSmooth
+        {
+            get => zoneSmooth;
+            set => SetZoneField(ref zoneSmooth, value);
+        }
+
+        /// <summary>Irrégularité du bord (m) : déplacement du contour par un bruit fractal. 0 = contour exact.</summary>
+        public float ZoneEdgeNoise
+        {
+            get => zoneEdgeNoise;
+            set => SetZoneField(ref zoneEdgeNoise, Mathf.Max(0f, value));
+        }
+
+        /// <summary>Taille des irrégularités du bord (m).</summary>
+        public float ZoneEdgeNoiseScale
+        {
+            get => zoneEdgeNoiseScale;
+            set => SetZoneField(ref zoneEdgeNoiseScale, Mathf.Max(0.5f, value));
+        }
+
+        /// <summary>Lisière (m) : la densité du placement baisse jusqu'à zéro sur cette distance avant le bord.</summary>
+        public float ZoneEdgeFeather
+        {
+            get => zoneEdgeFeather;
+            set => SetZoneField(ref zoneEdgeFeather, Mathf.Max(0f, value));
+        }
+
+        void SetZoneField<T>(ref T field, T value)
+        {
+            if (EqualityComparer<T>.Default.Equals(field, value))
+                return;
+            field = value;
+            SetDirty();
+        }
+
+        /// <summary>Graine du bruit du bord (celle du placement), sur 24 bits : passée au GPU dans un flottant.</summary>
+        uint ZoneNoiseSeed => (uint)randomSeed & 0xFFFFFFu;
+
+        /// <summary>
+        /// Bord de la zone en (x, z) monde, &lt;= 0 dedans (même calcul que le GPU) ; 'feather' : compter la lisière comme
+        /// bord (distance calculée même sans bruit).
+        /// </summary>
+        float ZoneEdge(Vector2 xz, IReadOnlyList<Vector2> worldOutline, bool feather)
+        {
+            bool natural = zoneEdgeNoise > 0f || (feather && zoneEdgeFeather > 0f);
+            Vector3 top = ZoneCenter;
+            return ZoneShape.Edge(xz, worldOutline, zoneEdgeNoise, 1f / zoneEdgeNoiseScale, natural, new Vector2(top.x, top.z), ZoneNoiseSeed);
+        }
+
+        /// <summary>Instances hors de la texture de profondeur de la caméra (voir l'infobulle du réglage) : plus d'ombres reçues.</summary>
+        public bool ExcludeFromDepthTexture
+        {
+            get => excludeFromDepthTexture;
+            set
+            {
+                if (excludeFromDepthTexture == value)
+                    return;
+                excludeFromDepthTexture = value;
+                SetDirty();
+            }
+        }
+
+        /// <summary>Destruction des instances hors du volume (au placement, puis sur GPU jusqu'à la prochaine reconstruction).</summary>
+        public bool ClipToVolume
+        {
+            get => clipToVolume;
+            set
+            {
+                if (clipToVolume == value)
+                    return;
+                clipToVolume = value;
+                SetDirty();
+            }
+        }
+
+        /// <summary>
+        /// DIAGNOSTIC : avec ClipToVolume, le mouvement du comportement (vagues, dandinement...) dépasse la hauteur du volume :
+        /// les instances qui en sortent seront détruites. Calculé à la reconstruction.
+        /// </summary>
+        public bool MotionExceedsVolumeHeight { get; private set; }
+
+        /// <summary>
+        /// Remplace la zone : centre de la face du haut (par rapport à l'objet), sommets (X, Z) par rapport à ce centre,
+        /// dans l'ordre du contour (3 à MaxZonePoints), profondeur vers le bas. Coût : une reconstruction.
+        /// </summary>
+        public void SetZone(Vector3 centerOffset, IEnumerable<Vector2> points, float depth)
+        {
+            var list = new List<Vector2>(points);
+            if (list.Count < 3 || list.Count > MaxZonePoints)
+                throw new ArgumentException($"La zone doit avoir de 3 à {MaxZonePoints} sommets ({list.Count}).", nameof(points));
+            zoneCenter = centerOffset;
+            zonePoints = list;
+            zoneDepth = Mathf.Max(0f, depth);
+            SetDirty();
+        }
+
+        /// <summary>Sommets d'un rectangle centré (X, Z), dans l'ordre du contour.</summary>
+        public static List<Vector2> RectanglePoints(Vector2 size)
+        {
+            Vector2 h = size * 0.5f;
+            return new List<Vector2> { new Vector2(-h.x, -h.y), new Vector2(h.x, -h.y), new Vector2(h.x, h.y), new Vector2(-h.x, h.y) };
+        }
+
+        /// <summary>
+        /// Point monde dans le volume actuel de la zone : hauteur, contour (courbe et bord naturel compris), même règle que le
+        /// placement et le GPU, à l'arrondi près pour un point à quelques µm du bord. La lisière ne compte pas. Pour le gameplay.
+        /// </summary>
+        public bool VolumeContains(Vector3 worldPosition)
+        {
+            Vector3 top = ZoneCenter;
+            if (worldPosition.y > top.y + ZoneHeightTolerance || worldPosition.y < top.y - zoneDepth - ZoneHeightTolerance)
+                return false;
+            return ZoneEdge(new Vector2(worldPosition.x, worldPosition.z), WorldOutline(), false) <= 0f;
+        }
+
+        /// <summary>Contour effectif en coordonnées monde (x, z).</summary>
+        public List<Vector2> WorldOutline()
+        {
+            IReadOnlyList<Vector2> outline = ZoneOutline;
+            Vector3 top = ZoneCenter;
+            var world = new List<Vector2>(outline.Count);
+            foreach (Vector2 point in outline)
+                world.Add(new Vector2(top.x + point.x, top.z + point.y));
+            return world;
+        }
+
+        /// <summary>
+        /// Bord de la zone en (x, z) monde, comme sur GPU : &lt;= 0 dedans. Avec lisière : distance au bord, en mètres
+        /// (la densité du placement vaut min(1, -bord / lisière)). Pour les outils (contour dans la vue Scene).
+        /// </summary>
+        public float ZoneEdgeAt(Vector2 worldXZ, IReadOnlyList<Vector2> worldOutline, bool withFeather) => ZoneEdge(worldXZ, worldOutline, withFeather);
 
         /// <summary>Remplace les variantes (meshes, LODs, matériaux).</summary>
         public void SetVariants(IEnumerable<InstanceVariant> newVariants)
@@ -315,16 +558,32 @@ namespace Nyx.GpuInstancing
             return true;
         }
 
+        /// <summary>
+        /// DIAGNOSTIC / TESTS : les destination.Length premières instances telles que le GPU les a reçues.
+        /// Lecture GPU bloquante : à ne jamais appeler en jeu. false si le spawner n'est pas construit.
+        /// </summary>
+        public bool TryReadInstances(GpuInstanceData[] destination)
+        {
+            if (!_built || destination == null || _instanceBuffer == null || !_instanceBuffer.IsValid())
+                return false;
+            _instanceBuffer.GetData(destination, 0, 0, Mathf.Min(destination.Length, InstanceCount));
+            return true;
+        }
+
         [ContextMenu("Figer le placement procédural dans la liste")]
         public void FreezePlacement()
         {
+            if (!SystemInfo.supportsComputeShaders || !LoadBuildShader())
+            {
+                Debug.LogError($"{name} : placement impossible sans compute shaders ({BuildShaderResource}).", this);
+                return;
+            }
 #if UNITY_EDITOR
             UnityEditor.Undo.RecordObject(this, "Figer le placement");
 #endif
-            GeneratePlacements();
-            placements = new List<MeshPlacement>(_placements.Length);
-            for (int i = 0; i < _placements.Length; i++)
-                placements.Add(_placements[i]);
+            NativeArray<MeshPlacement> generated = ReadPlacements(PreparePlacement(), Allocator.Persistent);
+            placements = new List<MeshPlacement>(generated.ToArray());
+            generated.Dispose();
             source = PlacementSource.List;
             SetDirty();
 #if UNITY_EDITOR
@@ -355,6 +614,8 @@ namespace Nyx.GpuInstancing
             OceanWaves.Changed -= SetDirty;
             ReleaseRenderResources();
             ReleaseInstanceBuffer();
+            _zoneVertexBuffer?.Release();
+            _zoneVertexBuffer = null;
             DisposePlacements();
         }
 
@@ -362,18 +623,36 @@ namespace Nyx.GpuInstancing
         {
             if (scaleRange.y < scaleRange.x)
                 scaleRange.y = scaleRange.x;
+            if (zonePoints.Count > MaxZonePoints)
+                zonePoints.RemoveRange(MaxZonePoints, zonePoints.Count - MaxZonePoints);
             SetDirty();
         }
 
+#if UNITY_EDITOR
+        /// <summary>
+        /// Nouveau spawner : zone rectangulaire éditable et destruction par le volume. Les spawners enregistrés avant la zone
+        /// n'ont ni sommets ni destruction : même placement qu'avant. Le comportement ajouté ensuite peut changer ces défauts.
+        /// </summary>
+        void Reset()
+        {
+            zonePoints = RectanglePoints(areaSize);
+            clipToVolume = true;
+            SetDirty();
+        }
+#endif
+
         void Update()
         {
-            // Mode édition uniquement : le placement suit l'objet et les ancres pendant que le level designer les déplace.
-            // En jeu, le placement est figé (une mine qui flotte ne doit pas régénérer le champ à chaque frame) :
+            // Mode édition uniquement : le placement et le volume suivent l'objet et les ancres pendant que le level designer
+            // les déplace. En jeu, ils sont figés (une mine qui flotte ne doit pas régénérer le champ à chaque frame) :
             // appeler SetDirty() après un déplacement volontaire.
-            if (Application.isPlaying || source != PlacementSource.Procedural)
+            if (Application.isPlaying)
                 return;
             MeshSpawnerBehavior behavior = FindBehavior();
-            if (behavior == null || !behavior.UsesPlacement)
+            if (behavior == null)
+                return;
+            bool procedural = behavior.UsesPlacement && source == PlacementSource.Procedural;
+            if (!procedural && !clipToVolume)
                 return;
 
             if (transform.hasChanged)
@@ -382,6 +661,8 @@ namespace Nyx.GpuInstancing
                 SetDirty();
                 return;
             }
+            if (!procedural)
+                return;
             for (int i = 0; i < clusterAnchors.Count && i < _anchorPositions.Count; i++)
             {
                 Transform anchor = clusterAnchors[i];
@@ -458,6 +739,7 @@ namespace Nyx.GpuInstancing
         {
             if (!isActiveAndEnabled || !ShouldRenderFor(camera))
                 return;
+            using ProfilerMarker.AutoScope profilerScope = Markers.Render.Auto();
 
             if (!SystemInfo.supportsComputeShaders)
             {
@@ -498,6 +780,16 @@ namespace Nyx.GpuInstancing
             cs.SetFloat(ShaderIds.Time, CurrentTime);
             cs.SetInt(ShaderIds.InstanceCount, InstanceCount);
             cs.SetInt(ShaderIds.BucketCount, _bucketCount);
+            cs.SetInt(ShaderIds.DeadVariant, _deadVariant);
+            cs.SetInt(ShaderIds.ZonePointCount, _zonePointCountGpu);
+            cs.SetBuffer(_kernelCull, ShaderIds.ZoneVertices, _zoneVertexBuffer);
+            if (_zonePointCountGpu > 0)
+            {
+                cs.SetVector(ShaderIds.ZoneBounds, _zoneBoundsGpu);
+                cs.SetVector(ShaderIds.ZoneHeight, _zoneHeightGpu);
+                cs.SetVector(ShaderIds.ZoneNatural, _zoneNaturalGpu);
+                cs.SetVector(ShaderIds.ZoneOrigin, _zoneOriginGpu);
+            }
             behavior.SetShaderParameters(cs, camera);
 
             cs.SetBuffer(_kernelCull, ShaderIds.Instances, _instanceBuffer);
@@ -509,11 +801,7 @@ namespace Nyx.GpuInstancing
             cs.SetBuffer(_kernelWriteArgs, ShaderIds.Counters, buffers.counters);
             cs.SetBuffer(_kernelWriteArgs, ShaderIds.Args, state.args);
 
-            int groups = (InstanceCount + ThreadGroupSize - 1) / ThreadGroupSize;
-            int groupsX = Mathf.Min(groups, MaxGroupsPerDimension);
-            int groupsY = (groups + groupsX - 1) / groupsX;
-            cs.SetInt(ShaderIds.GroupsX, groupsX);
-            cs.Dispatch(_kernelCull, groupsX, groupsY, 1);
+            DispatchInstances(cs, _kernelCull, InstanceCount);
             cs.Dispatch(_kernelWriteArgs, 1, 1, 1);   // _bucketCount <= 64 : un seul groupe
 
             // En Single Pass Instanced, le nombre d'instances est doublé pour les passes caméra, mais la carte
@@ -521,12 +809,14 @@ namespace Nyx.GpuInstancing
             bool shadows = castShadows != ShadowCastingMode.Off;
             bool splitShadows = shadows && multiplier > 1;
             ShadowCastingMode mainShadows = splitShadows ? ShadowCastingMode.Off : castShadows;
+            bool receive = receiveShadows && !excludeFromDepthTexture;
+            SyncDepthlessMaterials();
             for (int b = 0; b < _bucketCount; b++)
             {
                 Graphics.DrawMeshInstancedIndirect(
                     _bucketMeshes[b], _bucketSubMeshes[b], _bucketMaterials[b], _worldBounds,
                     state.args, b * ArgsPerDraw * sizeof(uint), buffers.blocks[b],
-                    mainShadows, receiveShadows, renderLayer, camera, LightProbeUsage.Off);
+                    mainShadows, receive, renderLayer, camera, LightProbeUsage.Off);
 
                 if (splitShadows)
                 {
@@ -713,6 +1003,14 @@ namespace Nyx.GpuInstancing
             _worldBounds = _buildBounds;
             if (_dynamicBounds.HasValue)
                 _worldBounds.Encapsulate(_dynamicBounds.Value);
+            if (_zoneDrawBounds.HasValue)
+            {
+                // Les instances détruites hors du volume ne sont jamais dessinées : le draw tient dans le volume
+                Bounds zone = _zoneDrawBounds.Value;
+                Vector3 min = Vector3.Max(_worldBounds.min, zone.min);
+                Vector3 max = Vector3.Max(min, Vector3.Min(_worldBounds.max, zone.max));
+                _worldBounds.SetMinMax(min, max);
+            }
         }
 
         // ------------------------------------------------------------------------------------------
@@ -721,8 +1019,12 @@ namespace Nyx.GpuInstancing
 
         void Rebuild()
         {
+            using ProfilerMarker.AutoScope profilerScope = Markers.Rebuild.Auto();
             ReleaseRenderResources();
             _dirty = false;
+            DisposePlacements();
+            _placementSetup = null;
+            LastUploadMethod = UploadMethod.None;
 
             MeshSpawnerBehavior behavior = FindBehavior();
             if (behavior == null)
@@ -731,11 +1033,17 @@ namespace Nyx.GpuInstancing
                     Debug.LogWarning($"{name} : aucun comportement (MeshSpawnerBehavior) sur l'objet, rien n'est dessiné. " +
                                      "Ajouter par exemple Static Instances, Float On Waves ou Bubble Columns.", this);
                 _warnedNoBehavior = true;
-                DisposePlacements();
                 ReleaseInstanceBuffer();
                 return;
             }
             _warnedNoBehavior = false;
+            if (!SystemInfo.supportsComputeShaders)
+                return;   // signalé au rendu : rien ne serait dessiné
+            if (!LoadBuildShader())
+            {
+                Debug.LogError($"{name} : compute shader {BuildShaderResource} introuvable ou invalide (dossier Resources du package).", this);
+                return;
+            }
             _cullingShader = behavior.CullingShader;
             if (_cullingShader == null)
             {
@@ -746,74 +1054,57 @@ namespace Nyx.GpuInstancing
             _kernelWriteArgs = _cullingShader.FindKernel("NyxWriteArgs");
 
             int variantCount = variants.Count;
+            if (variantCount > MaxVariants)
+            {
+                Debug.LogError($"{name} : {variantCount} variantes > {MaxVariants}. Réduisez les variantes.", this);
+                return;
+            }
             var lodCounts = new int[variantCount];
+            int bucketCount = 0;
+            _validVariantsLow = _validVariantsHigh = 0;
             for (int v = 0; v < variantCount; v++)
             {
                 lodCounts[v] = LodCount(variants[v]);
+                bucketCount += lodCounts[v];
+                if (lodCounts[v] == 0)
+                    continue;
+                if (v < 32)
+                    _validVariantsLow |= 1u << v;
+                else
+                    _validVariantsHigh |= 1u << (v - 32);
                 // Avec « Instancing Variants : Strip Unused » (réglage par défaut), un build supprime les variantes
                 // instanciées des shaders dont aucun matériau n'a l'instancing coché : rien ne s'afficherait.
-                if (lodCounts[v] > 0 && !variants[v].material.enableInstancing)
+                if (!variants[v].material.enableInstancing)
                     Debug.LogWarning($"{name} : cochez « Enable GPU Instancing » sur le matériau '{variants[v].material.name}', sinon rien ne s'affichera dans les builds.", this);
             }
+            if (bucketCount > MaxBuckets)
+            {
+                Debug.LogError($"{name} : {bucketCount} draws (variantes × LODs) > {MaxBuckets}. Réduisez les variantes ou les LODs.", this);
+                return;
+            }
 
-            // 1. Instances, construites en mémoire native (jobs Burst) et libérées dès l'envoi au GPU
-            NativeArray<GpuInstanceData> instances = default;
-            var perVariant = new NativeArray<int>(variantCount, Allocator.TempJob);
-            var validVariants = new NativeArray<int>(variantCount, Allocator.TempJob);
+            CacheZoneVolume();
+            _deadVariant = variantCount;
+            _zoneDrawBounds = null;
+            MotionExceedsVolumeHeight = false;
+            SetVariantParameters(s_buildShader);
+
+            // Instances construites sur GPU (ou écrites en C# puis envoyées), et leur nombre par variante. Une variante
+            // invalide (mesh/matériau manquant) pointe vers une variante "désactivée" : les index restent stables.
+            var perVariant = new NativeArray<int>(variantCount, Allocator.Temp);
             try
             {
-                if (behavior.UsesPlacement)
-                {
-                    GeneratePlacements();
-                    instances = new NativeArray<GpuInstanceData>(_placements.Length, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-                    _buildBounds = new Bounds(transform.position, Vector3.one);
-                    if (_placements.Length > 0)
-                    {
-                        behavior.CreateInstances(_placements, instances);
-                        _buildBounds = behavior.GetPlacementBounds(PlacementBounds(out float maxScale), (MaxVariantRadius() + boundsPadding) * maxScale);
-                    }
-                }
-                else
-                {
-                    DisposePlacements();
-                    instances = new NativeArray<GpuInstanceData>(Mathf.Max(0, behavior.GetInstanceCount()), Allocator.TempJob);
-                    _buildBounds = behavior.BuildInstances(instances);
-                }
+                int instanceCount;
+                using (Markers.BuildInstances.Auto())
+                    instanceCount = behavior.UsesPlacement ? BuildPlacedInstances(behavior, perVariant) : BuildBehaviorInstances(behavior, perVariant);
                 UpdateWorldBounds();
-
-                // 2. Instances par variante ; une variante invalide (mesh/matériau manquant) pointe vers une variante
-                //    "désactivée" : les index restent stables pour les mises à jour partielles.
-                for (int v = 0; v < variantCount; v++)
-                    validVariants[v] = lodCounts[v] > 0 ? 1 : 0;
-                new MeshSpawnerJobs.CountVariantsJob
-                {
-                    instances = instances,
-                    validVariants = validVariants,
-                    perVariant = perVariant,
-                    disabledVariant = variantCount
-                }.Run();
-
-                if (!BuildBuckets(behavior, lodCounts, perVariant))
-                    return;
-
-                // 3. Envoi au GPU (buffer réutilisé si le nombre d'instances n'a pas changé)
-                int instanceCount = instances.Length;
-                if (_instanceBuffer == null || !_instanceBuffer.IsValid() || _instanceBuffer.count != Mathf.Max(instanceCount, 1))
-                {
-                    ReleaseInstanceBuffer();
-                    _instanceBuffer = new ComputeBuffer(Mathf.Max(instanceCount, 1), GpuInstanceData.Stride, ComputeBufferType.Default);
-                }
-                if (instanceCount > 0)
-                    _instanceBuffer.SetData(instances);
+                BuildBuckets(behavior, lodCounts, perVariant);
                 InstanceCount = instanceCount;
                 _built = true;
             }
             finally
             {
-                if (instances.IsCreated)
-                    instances.Dispose();
                 perVariant.Dispose();
-                validVariants.Dispose();
             }
         }
 
@@ -822,17 +1113,12 @@ namespace Nyx.GpuInstancing
         /// le pire cas (toutes les instances de la variante dans ce LOD) ; les données de rendu (64 octets) ne sont écrites
         /// qu'une fois par instance visible, toutes variantes confondues.
         /// </summary>
-        bool BuildBuckets(MeshSpawnerBehavior behavior, int[] lodCounts, NativeArray<int> perVariant)
+        void BuildBuckets(MeshSpawnerBehavior behavior, int[] lodCounts, NativeArray<int> perVariant)
         {
             int variantCount = lodCounts.Length;
             int bucketCount = 0;
             for (int v = 0; v < variantCount; v++)
-                bucketCount += lodCounts[v];
-            if (bucketCount > MaxBuckets)
-            {
-                Debug.LogError($"{name} : {bucketCount} draws (variantes × LODs) > {MaxBuckets}. Réduisez les variantes ou les LODs.", this);
-                return false;
-            }
+                bucketCount += lodCounts[v];   // <= MaxBuckets (vérifié par Rebuild)
 
             _bucketMeshes = new Mesh[bucketCount];
             _bucketMaterials = new Material[bucketCount];
@@ -873,7 +1159,7 @@ namespace Nyx.GpuInstancing
                     Mesh mesh = variant.lodMeshes[lod];
                     int subMesh = Mathf.Clamp(variant.subMeshIndex, 0, mesh.subMeshCount - 1);
                     _bucketMeshes[bucket] = mesh;
-                    _bucketMaterials[bucket] = variant.material;
+                    _bucketMaterials[bucket] = DrawMaterial(variant.material);
                     _bucketSubMeshes[bucket] = subMesh;
                     _bucketLabels[bucket] = $"v{v}/LOD{lod}";
                     _bucketOffsets[bucket] = indexSlots;
@@ -899,88 +1185,82 @@ namespace Nyx.GpuInstancing
             _visibleCapacity = validInstances;
             _indexCapacity = (int)indexSlots;
             _bucketCount = bucketCount;
-            return true;
         }
 
-        /// <summary>Placements en mémoire native : générés par un job Burst, ou recopiés de la liste sérialisée.</summary>
-        void GeneratePlacements()
+        /// <summary>Sommets de la zone en coordonnées monde (x, z) et leur boîte (min x, min z, max x, max z).</summary>
+        NativeArray<float2> ZonePolygonWorld(Allocator allocator, out float4 bounds)
         {
-            DisposePlacements();
-            int variantCount = Mathf.Max(variants.Count, 1);
-            Vector3 center = transform.position;
-
-            _anchorPositions.Clear();
-            foreach (Transform anchor in clusterAnchors)
-                _anchorPositions.Add(anchor != null ? anchor.position : Vector3.zero);
-
-            if (source == PlacementSource.List)
+            IReadOnlyList<Vector2> points = ZoneOutline;
+            Vector3 top = ZoneCenter;
+            var polygon = new NativeArray<float2>(points.Count, allocator, NativeArrayOptions.UninitializedMemory);
+            bounds = new float4(float.MaxValue, float.MaxValue, float.MinValue, float.MinValue);
+            for (int i = 0; i < points.Count; i++)
             {
-                _placements = new NativeArray<MeshPlacement>(placements.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                for (int i = 0; i < placements.Count; i++)
-                {
-                    MeshPlacement placement = placements[i];
-                    placement.variant = Mathf.Clamp(placement.variant, 0, variantCount - 1);
-                    _placements[i] = placement;
-                }
+                var p = new float2(top.x + points[i].x, top.z + points[i].y);
+                polygon[i] = p;
+                bounds = new float4(math.min(bounds.xy, p), math.max(bounds.zw, p));
+            }
+            return polygon;
+        }
+
+        /// <summary>Quatre sommets aux coins de leur boîte, reliés par des arêtes parallèles aux axes (pas un nœud papillon).</summary>
+        static bool IsAxisAlignedRectangle(NativeArray<float2> polygon, float4 bounds)
+        {
+            if (polygon.Length != 4)
+                return false;
+            int corners = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                float2 p = polygon[i];
+                float2 next = polygon[(i + 1) & 3];
+                bool cornerX = p.x == bounds.x || p.x == bounds.z;
+                bool cornerZ = p.y == bounds.y || p.y == bounds.w;
+                if (!cornerX || !cornerZ || (p.x != next.x && p.y != next.y))
+                    return false;
+                corners |= 1 << ((p.x == bounds.z ? 1 : 0) + (p.y == bounds.w ? 2 : 0));
+            }
+            return corners == 15;
+        }
+
+        /// <summary>Boîte monde du volume de la zone (polygone × profondeur).</summary>
+        Bounds ZoneVolumeBounds()
+        {
+            NativeArray<float2> polygon = ZonePolygonWorld(Allocator.Temp, out float4 b);
+            polygon.Dispose();
+            float topY = ZoneCenter.y;
+            var bounds = new Bounds();
+            bounds.SetMinMax(new Vector3(b.x - zoneEdgeNoise, topY - zoneDepth, b.y - zoneEdgeNoise), new Vector3(b.z + zoneEdgeNoise, topY, b.w + zoneEdgeNoise));
+            return bounds;
+        }
+
+        /// <summary>Paramètres du bord naturel pour le GPU (_NyxZoneNatural, _NyxZoneOrigin) ; lisière comprise ou non.</summary>
+        void ZoneNaturalGpu(bool feather, out Vector4 natural, out Vector4 origin)
+        {
+            natural = new Vector4(zoneEdgeNoise, 1f / zoneEdgeNoiseScale, feather ? zoneEdgeFeather : 0f, 0f);
+            Vector3 top = ZoneCenter;
+            origin = new Vector4(top.x, top.z, ZoneNoiseSeed, 0f);
+        }
+
+        /// <summary>Volume figé pour la destruction sur GPU (posé à chaque dispatch de culling) : rien si ClipToVolume est décoché.</summary>
+        void CacheZoneVolume()
+        {
+            _zonePointCountGpu = 0;
+            _zoneVertexBuffer?.Release();   // détruit par Unity après les dispatchs déjà soumis qui le lisent
+            _zoneVertexBuffer = null;
+            if (!clipToVolume)
+            {
+                _zoneVertexBuffer = new ComputeBuffer(1, 2 * sizeof(float));   // le noyau de culling le déclare : toujours lié
                 return;
             }
-
-            int cellsX = 0, cellsZ = 0;
-            float stepX = 0f, stepZ = 0f;
-            if (densityPer100m2 > 0f && areaSize.x > 0f && areaSize.y > 0f)
-            {
-                float cell = Mathf.Sqrt(100f / densityPer100m2);
-                cellsX = Mathf.Max(1, Mathf.RoundToInt(areaSize.x / cell));
-                cellsZ = Mathf.Max(1, Mathf.RoundToInt(areaSize.y / cell));
-                if ((long)cellsX * cellsZ > MaxGeneratedInstances)
-                {
-                    Debug.LogWarning($"{name} : {(long)cellsX * cellsZ} instances demandées, limité à {MaxGeneratedInstances}.", this);
-                    float reduction = Mathf.Sqrt((float)MaxGeneratedInstances / ((long)cellsX * cellsZ));
-                    cellsX = Mathf.Max(1, (int)(cellsX * reduction));
-                    cellsZ = Mathf.Max(1, (int)(cellsZ * reduction));
-                }
-                stepX = areaSize.x / cellsX;
-                stepZ = areaSize.y / cellsZ;
-            }
-
-            var anchors = new NativeArray<float3>(clusterAnchors.Count, Allocator.TempJob);
-            int anchorCount = 0;
-            foreach (Transform anchor in clusterAnchors)
-            {
-                if (anchor != null)
-                    anchors[anchorCount++] = anchor.position;
-            }
-            int gridCount = cellsX * cellsZ;
-            int total = gridCount + anchorCount * clumpsPerCluster;
-            _placements = new NativeArray<MeshPlacement>(total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-            new MeshSpawnerJobs.GeneratePlacementsJob
-            {
-                output = _placements,
-                anchors = anchors,
-                seed = (uint)randomSeed,
-                cellsX = Mathf.Max(cellsX, 1),
-                gridCount = gridCount,
-                origin = new float2(center.x - areaSize.x * 0.5f, center.z - areaSize.y * 0.5f),
-                step = new float2(stepX, stepZ),
-                height = center.y,
-                clumpsPerCluster = Mathf.Max(clumpsPerCluster, 1),
-                clusterRadius = clusterRadius,
-                scaleRange = new float2(scaleRange.x, scaleRange.y),
-                variantCount = variantCount
-            }.Schedule(total, MeshSpawnerJobs.BatchSize).Complete();
-            anchors.Dispose();
-        }
-
-        /// <summary>Boîte des positions au repos des placements (job Burst) et plus grande échelle.</summary>
-        Bounds PlacementBounds(out float maxScale)
-        {
-            var result = new NativeArray<float4>(2, Allocator.TempJob);
-            new MeshSpawnerJobs.PlacementBoundsJob { placements = _placements, result = result }.Run();
-            var bounds = new Bounds();
-            bounds.SetMinMax(result[0].xyz, result[1].xyz);
-            maxScale = result[1].w;
-            result.Dispose();
-            return bounds;
+            NativeArray<float2> polygon = ZonePolygonWorld(Allocator.Temp, out float4 b);
+            _zoneVertexBuffer = new ComputeBuffer(polygon.Length, 2 * sizeof(float));
+            _zoneVertexBuffer.SetData(polygon);
+            _zonePointCountGpu = polygon.Length;
+            polygon.Dispose();
+            _zoneBoundsGpu = new Vector4(b.x - zoneEdgeNoise, b.y - zoneEdgeNoise, b.z + zoneEdgeNoise, b.w + zoneEdgeNoise);
+            ZoneNaturalGpu(false, out _zoneNaturalGpu, out _zoneOriginGpu);   // destruction : bord seulement, sans lisière
+            float topY = ZoneCenter.y;
+            _zoneHeightGpu = new Vector2(topY - zoneDepth - ZoneHeightTolerance, topY + ZoneHeightTolerance);
         }
 
         /// <summary>Plus grand rayon des meshes (depuis leur pivot), toutes variantes et LODs confondus.</summary>
@@ -1048,12 +1328,75 @@ namespace Nyx.GpuInstancing
             InstanceCount = 0;
             _built = false;
             _dirty = true;
+            foreach (Material copy in _depthlessMaterials.Values)
+            {
+                if (copy == null)
+                    continue;
+                if (Application.isPlaying)
+                    Destroy(copy);   // après la frame : aucun draw en cours ne la référence plus
+                else
+                    DestroyImmediate(copy);
+            }
+            _depthlessMaterials.Clear();
+        }
+
+        /// <summary>Plus haute file de rendu dessinée dans la texture de profondeur de la caméra (pipeline Built-in).</summary>
+        const int DepthTextureMaxQueue = 2500;
+
+        /// <summary>
+        /// Matériau d'un draw : l'original, ou avec Exclude From Depth Texture sa copie dont la file de rendu passe au-dessus de
+        /// 2500 (Unity n'y dessine que les files jusqu'à 2500). Copie gardée jusqu'à la prochaine reconstruction.
+        /// </summary>
+        Material DrawMaterial(Material material)
+        {
+            if (!excludeFromDepthTexture || material.renderQueue > DepthTextureMaxQueue)
+                return material;
+            if (!_depthlessMaterials.TryGetValue(material, out Material copy) || copy == null)
+            {
+                copy = new Material(material) { name = material.name + " (hors profondeur)", hideFlags = HideFlags.HideAndDontSave };
+                _depthlessMaterials[material] = copy;
+            }
+            copy.renderQueue = DepthTextureMaxQueue + 1;
+            return copy;
+        }
+
+        /// <summary>Les copies hors profondeur suivent les réglages de leur matériau d'origine (modifiés dans l'inspecteur, animés...).</summary>
+        void SyncDepthlessMaterials()
+        {
+            foreach (KeyValuePair<Material, Material> pair in _depthlessMaterials)
+            {
+                Material original = pair.Key;
+                Material copy = pair.Value;
+                if (original == null || copy == null)
+                    continue;
+                if (copy.shader != original.shader)
+                    copy.shader = original.shader;
+                copy.CopyPropertiesFromMaterial(original);   // propriétés, mots-clés... et file de rendu
+                copy.enableInstancing = original.enableInstancing;
+                copy.renderQueue = DepthTextureMaxQueue + 1;
+            }
         }
 
         void ReleaseInstanceBuffer()
         {
             _instanceBuffer?.Release();
             _instanceBuffer = null;
+        }
+
+        // ------------------------------------------------------------------------------------------
+        // Envoi au GPU
+        // ------------------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Envoie les instances écrites en C# (comportement qui surcharge CreateInstance(s) ou BuildInstances) dans
+        /// _instanceBuffer. ComputeBuffer.SetData : copie par le pilote, puis transfert DMA. Mesuré plus rapide, jusqu'à la
+        /// fin du GPU, qu'une écriture directe dans un buffer SubUpdates copié par un compute shader (lecture lente de la
+        /// mémoire visible du CPU par le GPU).
+        /// </summary>
+        void UploadAll(NativeArray<GpuInstanceData> instances)
+        {
+            _instanceBuffer.SetData(instances);
+            LastUploadMethod = UploadMethod.SetData;
         }
 
         void DisposePlacements()
@@ -1102,6 +1445,15 @@ namespace Nyx.GpuInstancing
             });
         }
 
+        /// <summary>Sections nommées dans le Profiler. En vue Timeline, les jobs Burst de chaque section apparaissent sur les workers.</summary>
+        static class Markers
+        {
+            public static readonly ProfilerMarker Rebuild = new ProfilerMarker("MeshSpawner.Rebuild");
+            public static readonly ProfilerMarker BuildInstances = new ProfilerMarker("MeshSpawner.BuildInstances");
+            public static readonly ProfilerMarker Upload = new ProfilerMarker("MeshSpawner.Upload");
+            public static readonly ProfilerMarker Render = new ProfilerMarker("MeshSpawner.Render");
+        }
+
         static class ShaderIds
         {
             public static readonly int Instances = Shader.PropertyToID("_NyxInstances");
@@ -1124,6 +1476,13 @@ namespace Nyx.GpuInstancing
             public static readonly int RenderData = Shader.PropertyToID("_NyxRenderData");
             public static readonly int RenderIndex = Shader.PropertyToID("_NyxRenderIndex");
             public static readonly int BucketOffset = Shader.PropertyToID("_NyxBucketOffset");
+            public static readonly int DeadVariant = Shader.PropertyToID("_NyxDeadVariant");
+            public static readonly int ZonePointCount = Shader.PropertyToID("_NyxZonePointCount");
+            public static readonly int ZoneVertices = Shader.PropertyToID("_NyxZoneVertices");
+            public static readonly int ZoneBounds = Shader.PropertyToID("_NyxZoneBounds");
+            public static readonly int ZoneHeight = Shader.PropertyToID("_NyxZoneHeight");
+            public static readonly int ZoneNatural = Shader.PropertyToID("_NyxZoneNatural");
+            public static readonly int ZoneOrigin = Shader.PropertyToID("_NyxZoneOrigin");
         }
     }
 }

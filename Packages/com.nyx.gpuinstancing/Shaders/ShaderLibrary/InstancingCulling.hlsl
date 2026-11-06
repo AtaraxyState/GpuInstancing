@@ -14,13 +14,18 @@
 //                  et de leur index (4 octets) dans la zone du draw (variante x LOD) de _NyxVisibleIndex.
 //   NyxWriteArgs : 1 thread par draw -> nombre d'instances dans les arguments indirects, remise à zéro.
 // Mémoire par jeu de buffers : visibles x 64 octets + pire cas par draw x 4 octets (au lieu de 64 octets par LOD).
+//
+// Volume de la zone (MeshSpawner.ClipToVolume) : une instance dont la position évaluée sort du polygone extrudé est
+// détruite : sa variante devient la variante désactivée dans _NyxInstances, jusqu'au prochain envoi de cette instance
+// (reconstruction, ou mise à jour partielle comme Emit des bulles). Les instances détruites ne sont plus évaluées.
 
 #include "InstancingData.hlsl"
+#include "InstancingZone.hlsl"   // _NyxZone*, NyxInsideZone
 
-#define NYX_THREADS 64        // = MeshSpawner.ThreadGroupSize
-#define NYX_MAX_BUCKETS 64    // = MeshSpawner.MaxBuckets
+#define NYX_THREADS 64            // = MeshSpawner.ThreadGroupSize
+#define NYX_MAX_BUCKETS 64        // = MeshSpawner.MaxBuckets
 
-StructuredBuffer<NyxInstanceData>  _NyxInstances;
+RWStructuredBuffer<NyxInstanceData> _NyxInstances;     // écrit seulement pour détruire une instance (custom.w)
 StructuredBuffer<NyxVariantInfo>   _NyxVariants;
 StructuredBuffer<uint>             _NyxBucketOffsets;   // début de la zone d'index de chaque draw
 RWStructuredBuffer<NyxRenderData>  _NyxVisible;         // données de rendu des instances visibles, compactées
@@ -38,6 +43,7 @@ float4 _NyxFrustumPlanes[12];   // normales tournées vers l'intérieur
 float4 _NyxCameraPosition;      // xyz : position caméra, w : distance max²
 float4 _NyxCullParams;          // x : 1 / lodBias², y : (taille écran mini / échelle de projection)²
 float4 _NyxShadowSweep;         // xyz : demi-vecteur d'extrusion le long de la lumière (0 sans ombres)
+uint   _NyxDeadVariant;         // variante désactivée (= nombre de variantes) : instance invalide ou détruite
 
 groupshared uint gs_Count[NYX_MAX_BUCKETS];
 groupshared uint gs_Base[NYX_MAX_BUCKETS];
@@ -119,8 +125,13 @@ void NyxCull(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
     if (instanceIndex < _NyxInstanceCount)
     {
         NyxInstanceData src = _NyxInstances[instanceIndex];
-        if (NyxEvaluateInstance(instanceIndex, src, dst))
-            visible = NyxSelectBucket(src, dst, bucket);
+        if ((uint)src.custom.w != _NyxDeadVariant && NyxEvaluateInstance(instanceIndex, src, dst))
+        {
+            if (_NyxZonePointCount > 0 && !NyxInsideZone(float3(dst.row0.w, dst.row1.w, dst.row2.w)))
+                _NyxInstances[instanceIndex].custom.w = (float)_NyxDeadVariant;   // détruite jusqu'au prochain envoi
+            else
+                visible = NyxSelectBucket(src, dst, bucket);
+        }
     }
 
     // Réservation en 2 temps : atomique en mémoire partagée, puis 1 seule atomique globale
