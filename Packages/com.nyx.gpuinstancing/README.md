@@ -55,7 +55,7 @@ Trois réglages : le **centre de la face du haut** (`Zone Center`, décalage par
 - **Bord naturel** : quelques points de contrôle suffisent pour une zone au contour naturel. Le même calcul sert au placement, à la destruction et à `VolumeContains`.
   - *Zone Smooth* : courbe qui passe par chaque point (Catmull-Rom centripète), découpée en 64 sommets au plus.
   - *Zone Edge Noise* et *Zone Edge Noise Scale* : bord irrégulier, déplacé de ± l'amplitude par un bruit fractal suivant la taille des irrégularités.
-  - *Zone Edge Feather* : lisière, où la densité baisse jusqu'à zéro avant le bord.
+  - *Zone Edge Feather* : lisière, où la densité baisse jusqu'à zéro avant le bord. Placement procédural seulement : une liste, placement figé compris, garde toutes ses instances.
   - La vue Scene montre la courbe, le bord irrégulier et la limite de la lisière (pointillés).
   - Coût : 0,75 ms pour 1 000 000 de tests sur GTX 1060, contre 8 ms pour un contour décrit par 1 024 sommets. Plutôt que de longues listes de points, ajouter ces réglages : voir `Documentation~/Optimisations.md` et la scène de test `Assets/DevTools/Scenes/ZoneNaturelleTest.unity` du dépôt.
 
@@ -260,9 +260,10 @@ Dans le Profiler, les sections `MeshSpawner.Rebuild`, `MeshSpawner.BuildInstance
 ## Contenu
 
 ```
-Runtime/   MeshSpawner (buffers, culling par caméra, draws, VR), MeshSpawnerGpuBuild (construction sur GPU),
+Runtime/   MeshSpawner (composant : réglages, API, cycle de vie), ZoneVolume, PlacementSetup, InstanceBuilder,
+           InstanceRenderer, DrawBuckets, DepthlessMaterials, SpawnerGpu (voir « Organisation du code »),
            MeshSpawnerBehavior, FloatOnWaves, BubbleColumns, StaticInstances, BubbleBurstEmitter, OceanWaves,
-           NyxDefaultAssets (éditeur), NyxDemoWater, NyxFlyCamera
+           ZoneShape, NyxDefaultAssets (éditeur), NyxDemoWater, NyxFlyCamera
 Shaders/   Sargassum, Bubble, Lit, DemoWater, ShaderLibrary/ (données, setup, culling, zone, hasard, vagues),
            Resources/NyxGpuInstancing/ (un compute shader par comportement, chargé automatiquement ;
            InstanceBuild : placement, filtrage par la zone, instances, comptage par variante)
@@ -272,3 +273,27 @@ Defaults/  touffes, bulles, rochers, texture de fronde, matériaux
 ```
 
 Noms propres au package (namespace `Nyx.GpuInstancing`, shaders `Nyx/GPU Instancing/*`, menus `Nyx/GPU Instancing`) : il cohabite avec la version d'origine `Assets/NyxInstancing/` sans conflit.
+
+## Organisation du code
+
+Le `MeshSpawner` est une coque mince : réglages sérialisés, API publique, cycle de vie Unity. Il délègue à des classes C# internes, sans état Unity, qui possèdent leurs ressources GPU :
+
+| Classe | Rôle |
+|---|---|
+| `ZoneVolume` | Géométrie de la zone, figée à la lecture : contour (courbe ou non), bord naturel, appartenance, paramètres GPU. Calculs purs, miroir de `InstancingZone.hlsl`. |
+| `PlacementSetup` | Paramètres du placement sur GPU (grille, amas, liste, filtre de la zone), d'après les réglages. |
+| `InstanceBuilder` | Buffer d'instances : construction sur GPU (`InstanceBuild.compute`), ou instances écrites en C# puis envoyées ; placements relus à la demande. |
+| `InstanceRenderer` | Rendu par caméra : culling GPU, jeux de buffers partagés, arguments indirects, draws, destruction hors du volume. |
+| `DrawBuckets` | Les draws (variante × LOD) et la table des variantes, refaits à chaque reconstruction. |
+| `DepthlessMaterials` | Copies de matériaux hors de la texture de profondeur. |
+| `SpawnerGpu` | Dispatch « une instance par thread », lecture GPU, identifiants des propriétés, marqueurs du Profiler. |
+
+Règles à suivre en modifiant le package :
+
+- **Composant mince** : un MonoBehaviour garde les réglages, l'API et le cycle de vie ; le travail va dans une classe interne qui ne fait qu'une chose et libère ce qu'elle alloue.
+- **Données sur le chemin chaud** : structs, `NativeArray`, `ComputeBuffer`, aucune allocation par image (le benchmark le vérifie), aucun appel virtuel ni interface par instance. L'abstraction se place au niveau d'un spawner et d'une caméra.
+- **GPU d'abord** : le compute shader fait le travail ; un calcul fait aussi en C# (zone, hasard) sert à l'éditeur, au gameplay et aux tests.
+- **Parité testée** : tout calcul fait à la fois en HLSL et en C# a un test d'accord dans le test de fumée (modèle : `ZoneShape` / `InstancingZone.hlsl`).
+- **Comportements = stratégie** : le mouvement vient d'un `MeshSpawnerBehavior`, jamais d'un `if` sur le type dans le spawner.
+- **Sérialisation stable** : ne pas renommer ni déplacer un champ sérialisé sans `[FormerlySerializedAs]` ; les scènes existantes doivent s'ouvrir telles quelles.
+- **Refactor sans changement de résultat** : mêmes instances, mêmes images. Outil : `Assets/DevTools/Editor/RefactorParityCheck.cs` (`SaveReference` avant, `Compare` après : placements, draws, mémoire, zone et image identiques, instances à quelques ulp près), puis test de fumée et benchmark.

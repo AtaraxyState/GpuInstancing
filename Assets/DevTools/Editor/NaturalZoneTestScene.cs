@@ -214,6 +214,26 @@ static class NaturalZoneTestScene
         UnityEngine.Rendering.AsyncGPUReadback.Request(camera.targetTexture, 0, 0, 1, 0, 1, 0, 1).WaitForCompletion();
     }
 
+    /// <summary>Ouvre la scène de test, zone détaillée sélectionnée (si aucune scène ouverte n'a de modification non enregistrée).</summary>
+    public static void Open()
+    {
+        for (int i = 0; i < SceneManager.sceneCount; i++)
+        {
+            if (SceneManager.GetSceneAt(i).isDirty)
+            {
+                Write(new List<string> { $"ARRÊT : la scène {SceneManager.GetSceneAt(i).path} a des modifications non enregistrées." });
+                return;
+            }
+        }
+        EditorSceneManager.OpenScene(ScenePath);
+        foreach (GameObject root in SceneManager.GetActiveScene().GetRootGameObjects())
+        {
+            if (root.name.StartsWith("Zone détaillée"))
+                Selection.activeGameObject = root;
+        }
+        Write(new List<string> { $"ouverte : {SceneManager.GetActiveScene().path}" });
+    }
+
     /// <summary>Enregistre la scène de test si elle est ouverte.</summary>
     public static void Save()
     {

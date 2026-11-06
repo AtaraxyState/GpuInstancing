@@ -131,7 +131,8 @@ NyxPlacement NyxCandidate(uint index)
 
 // Gardé par la zone : la grille d'une zone non rectangulaire (ou à bord naturel) contre le bord ; avec le volume, tous les
 // candidats contre le bord et la hauteur. Lisière : à moins de _NyxZoneNatural.z mètres du bord, un candidat sur deux,
-// puis de moins en moins, est retiré (tirage propre au candidat, indépendant du placement).
+// puis de moins en moins, est retiré (tirage propre au candidat, indépendant du placement). Placement procédural
+// seulement : pour une liste (placement figé compris), _NyxZoneNatural.z vaut 0 et ses instances sont gardées.
 bool NyxKeepCandidate(uint index, NyxPlacement p)
 {
     bool inside = true;

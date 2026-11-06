@@ -111,7 +111,7 @@ namespace Nyx.GpuInstancing.Editor
 
             Color color = spawner.ClipToVolume ? ClipColor : ZoneColor;
             Handles.color = color;
-            bool shaped = spawner.ZoneSmooth || spawner.ZoneEdgeNoise > 0f || spawner.ZoneEdgeFeather > 0f;
+            bool shaped = spawner.ZoneSmooth || spawner.ZoneEdgeNoise > 0f || PlacementFeather(spawner) > 0f;
             if (shaped)
             {
                 // Points de contrôle en pointillés ; contour courbe et bord naturel en traits pleins
@@ -220,7 +220,7 @@ namespace Nyx.GpuInstancing.Editor
                 bottomRing[i] = topRing[i] + Vector3.down * depth;
             }
             float noise = spawner.ZoneEdgeNoise;
-            float feather = spawner.ZoneEdgeFeather;
+            float feather = PlacementFeather(spawner);
             Handles.color = noise > 0f ? new Color(color.r, color.g, color.b, 0.45f) : color;
             Handles.DrawAAPolyLine(noise > 0f ? 1.5f : 3f, topRing);
             Handles.color = color;
@@ -257,6 +257,10 @@ namespace Nyx.GpuInstancing.Editor
                     Handles.DrawDottedLine(feathered[i], feathered[i + 1], 2f);
             }
         }
+
+        /// <summary>Lisière qui agit sur le placement : aucune pour une liste (placement figé compris).</summary>
+        static float PlacementFeather(MeshSpawner spawner) =>
+            spawner.Source == MeshSpawner.PlacementSource.List ? 0f : spawner.ZoneEdgeFeather;
 
         static void Fill(List<Vector3> lines, List<Vector2> segments)
         {

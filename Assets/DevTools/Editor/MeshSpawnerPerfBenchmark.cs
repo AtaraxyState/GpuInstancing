@@ -105,10 +105,11 @@ static class MeshSpawnerPerfBenchmark
         lines.Add("");
         lines.Add("Zone (Static Instances, carré de 1 000 m à 1 / m²) : reconstruction ; culling GPU seul (tout évalué, rien dessiné)");
         var polygon = new List<Vector2>();
-        for (int i = 0; i < MeshSpawner.MaxZonePoints; i++)
+        const int starPoints = 64;   // fixe : MaxZonePoints vaut 4 096 depuis les longues listes
+        for (int i = 0; i < starPoints; i++)
         {
-            float angle = i * Mathf.PI * 2f / MeshSpawner.MaxZonePoints;
-            float radius = (i % 2 == 0 ? 500f : 420f);   // étoile : concave, 64 sommets (pire cas)
+            float angle = i * Mathf.PI * 2f / starPoints;
+            float radius = (i % 2 == 0 ? 500f : 420f);   // étoile : concave, 64 sommets
             polygon.Add(new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius);
         }
         var cases = new (string label, List<Vector2> points, bool clip)[]

@@ -8,7 +8,7 @@
 // Bord naturel (facultatif, _NyxZoneNatural.x > 0) : le bord est déplacé de ± amplitude par un bruit fractal (3 octaves),
 // mesuré depuis le centre de la zone : distance signée au polygone + bruit <= 0. Coût mesuré : 0,75 ms pour 1 000 000
 // de points avec 64 sommets (GTX 1060), contre 8 ms pour un contour décrit par 1 024 sommets.
-// Lisière (placement seulement) : la densité baisse sur _NyxZoneNatural.z mètres avant le bord.
+// Lisière (placement procédural seulement) : la densité baisse sur _NyxZoneNatural.z mètres avant le bord.
 
 #include "InstancingRandom.hlsl"
 

@@ -625,7 +625,7 @@ namespace Nyx.GpuInstancing.Editor
         /// <summary>
         /// Bord naturel : hexagone de 30 m à 1 / m², volume actif. Contour courbe, puis bruit du bord (± 4 m), puis lisière
         /// (6 m). Placement GPU d'accord avec VolumeContains (C#), contour réellement changé, densité réduite par la lisière,
-        /// placement reproductible.
+        /// placement reproductible ; figé dans la liste puis reconstruit, mêmes instances (la lisière n'est pas réappliquée).
         /// </summary>
         static void CheckNaturalZone(Report report)
         {
@@ -671,12 +671,26 @@ namespace Nyx.GpuInstancing.Editor
                 spawner.RebuildNow();
                 int again = spawner.InstanceCount;
 
+                // Placement figé : la liste garde exactement les instances gardées par la lisière (pas de seconde lisière)
+                var procedural = new GpuInstanceData[feathered];
+                spawner.TryReadInstances(procedural);
+                spawner.FreezePlacement();
+                spawner.RebuildNow();
+                int frozen = spawner.InstanceCount;
+                var fromList = new GpuInstanceData[frozen];
+                spawner.TryReadInstances(fromList);
+                int frozenDiff = Mathf.Abs(frozen - feathered);
+                for (int i = 0; i < Mathf.Min(frozen, feathered); i++)
+                    frozenDiff += Same(procedural[i], fromList[i]) ? 0 : 1;
+
                 // La courbe passe par les coins de l'hexagone : elle s'arrondit vers le cercle qui les relie (pi × 30² m²)
                 report.Check(smooth > plain && smooth < Mathf.PI * 900f * 1.03f && outline.Count > 6 && disagree <= noisy / 1000 && bulging > 0
-                             && noisy != smooth && feathered < noisy * 0.95f && feathered > noisy * 0.5f && again == feathered,
-                    "Zone : bord naturel (courbe, bruit du bord, lisière) placé sur GPU, d'accord avec VolumeContains",
+                             && noisy != smooth && feathered < noisy * 0.95f && feathered > noisy * 0.5f && again == feathered
+                             && spawner.Source == MeshSpawner.PlacementSource.List && frozenDiff == 0,
+                    "Zone : bord naturel (courbe, bruit du bord, lisière) placé sur GPU, d'accord avec VolumeContains ; placement figé identique",
                     $"hexagone {plain} ; courbe ({outline.Count} sommets) {smooth} ; + bruit ± 4 m {noisy} (dont {bulging} hors de la courbe, " +
-                    $"{disagree} en désaccord avec le C#) ; + lisière 6 m {feathered} (reconstruit : {again})");
+                    $"{disagree} en désaccord avec le C#) ; + lisière 6 m {feathered} (reconstruit : {again}) ; " +
+                    $"figé puis reconstruit : {frozen} ({frozenDiff} différence(s))");
             }
             finally
             {
