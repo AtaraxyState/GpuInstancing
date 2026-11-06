@@ -23,7 +23,7 @@ Journal des optimisations du package : ce qui a été changé, pourquoi, et ce q
 
 **Avant :** le placement (grille, amas, liste), le filtrage par la zone et les données d'instance étaient calculés sur le CPU par des jobs Burst, puis envoyés au GPU (64 octets par instance).
 
-**Après :** tout est calculé par `InstanceBuild.compute`, directement dans le buffer d'instances. Les colonnes de bulles sont construites par un noyau de `BubbleColumns.compute`. Le CPU ne prépare que quelques paramètres et ne lit que des compteurs (total, nombre par variante, boîte des positions) pour dimensionner les buffers.
+**Après :** tout est calculé sur GPU, directement dans le buffer d'instances (aujourd'hui `InstancePlacement.compute` et `InstanceVariants.compute`). Les colonnes de bulles sont construites par un noyau dédié (aujourd'hui `BubbleColumnsBuild.compute`). Le CPU ne prépare que quelques paramètres et ne lit que des compteurs (total, nombre par variante, boîte des positions) pour dimensionner les buffers.
 - Le tirage aléatoire de `Unity.Mathematics.Random` est porté à l'identique. Comparé à l'ancien calcul : mêmes nombres d'instances, mêmes variantes, mêmes graines ; positions à un arrondi de flottant près (0,5 mm à 5 km de l'origine). Les scènes existantes gardent leur placement.
 - Mémoire CPU retenue entre deux reconstructions : 28 o par instance → 0.
 

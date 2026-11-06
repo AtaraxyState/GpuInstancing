@@ -51,7 +51,7 @@ namespace Nyx.GpuInstancing
         }
     }
 
-    /// <summary>Propriétés des compute shaders de culling (InstancingCulling.hlsl) et de construction (InstanceBuild.compute).</summary>
+    /// <summary>Propriétés des compute shaders de culling (InstancingCulling.hlsl) et de construction (InstancePlacement.compute, InstanceVariants.compute, BubbleColumnsBuild.compute).</summary>
     internal static class ShaderIds
     {
         public static readonly int Instances = Shader.PropertyToID("_NyxInstances");

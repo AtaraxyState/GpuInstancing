@@ -8,7 +8,7 @@ namespace Nyx.GpuInstancing
 {
     /// <summary>
     /// Jobs Burst des instances écrites en C# (MeshSpawner.CreateInstancesOnGpu à false, ou base.CreateInstances appelée par
-    /// un comportement). Le placement et les instances par défaut sont construits sur GPU (InstanceBuild.compute).
+    /// un comportement). Le placement et les instances par défaut sont construits sur GPU (InstancePlacement.compute).
     /// CompileSynchronously : dans l'éditeur, la première exécution attend la compilation Burst au lieu de tourner en C#.
     /// </summary>
     public static class MeshSpawnerJobs
@@ -17,7 +17,7 @@ namespace Nyx.GpuInstancing
 
         /// <summary>
         /// Matrice lacet (rotation Y, convention Unity) + échelle uniforme + translation, en 3 lignes. Même calcul que
-        /// NyxPlacementInstance (InstanceBuild.compute), au sinus près.
+        /// NyxPlacementInstance (InstancingPlacement.hlsl), au sinus près.
         /// </summary>
         public static GpuInstanceData TrsInstance(float3 position, float yawDegrees, float scale, float seed, int variant)
         {

@@ -34,7 +34,7 @@ float3x3 NyxFromToRotation(float3 from, float3 to)
         v.z * v.x * k - v.y,  v.z * v.y * k + v.x,  v.z * v.z * k + c);
 }
 
-// Disposition par défaut des instances placées (construites sur GPU, InstanceBuild.compute) :
+// Disposition par défaut des instances placées (construites sur GPU, InstancePlacement.compute) :
 //   row0..row2 : matrice de repos 3x4 (lacet + échelle), translation x et z (y ignoré : la hauteur vient de l'eau)
 //   custom     : x = graine 0..1, w = variante
 bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)

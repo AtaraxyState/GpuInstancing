@@ -129,9 +129,10 @@ namespace Nyx.GpuInstancing.Editor
                 CheckCompute(report, shader, "NyxGpuInstancing/" + compute, "NyxCull", "NyxWriteArgs");
                 computesFound &= shader != null;
             }
-            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/BubbleColumns"), "NyxGpuInstancing/BubbleColumns (construction)", "NyxBuildBubbles");
-            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/InstanceBuild"), "NyxGpuInstancing/InstanceBuild",
-                "NyxCountPlacements", "NyxScanGroups", "NyxWriteInstances", "NyxWritePlacements", "NyxCountVariants");
+            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/BubbleColumnsBuild"), "NyxGpuInstancing/BubbleColumnsBuild", "NyxBuildBubbles");
+            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/InstancePlacement"), "NyxGpuInstancing/InstancePlacement",
+                "NyxCountPlacements", "NyxScanGroups", "NyxWriteInstances", "NyxWritePlacements");
+            CheckCompute(report, Resources.Load<ComputeShader>("NyxGpuInstancing/InstanceVariants"), "NyxGpuInstancing/InstanceVariants", "NyxCountVariants");
             if (sargassumShader == null || bubbleShader == null || litShader == null || !computesFound)
                 return;
 
@@ -661,7 +662,7 @@ namespace Nyx.GpuInstancing.Editor
                     if (!spawner.VolumeContains(placement.position))
                         disagree++;
                     var xz = new Vector2(placement.position.x, placement.position.z);
-                    if (ZoneShape.Edge(xz, outline, 0f, 1f, false, Vector2.zero, 0u) > 0f)
+                    if (ZoneEdge.Evaluate(xz, outline, 0f, 1f, false, Vector2.zero, 0u) > 0f)
                         bulging++;   // hors de la courbe : le bruit a poussé le bord vers l'extérieur
                 }
 

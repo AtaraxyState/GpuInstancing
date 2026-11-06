@@ -50,16 +50,15 @@ namespace Nyx.GpuInstancing
         public long GpuBytes => SpawnerGpu.Size(_variantBuffer) + SpawnerGpu.Size(_offsetBuffer);
 
         /// <summary>
-        /// Draws des variantes (lodCounts : LODs valides de chacune, 0 = variante désactivée), d'après le nombre d'instances
-        /// de chaque variante. Avec excludeFromDepthTexture, les draws utilisent des copies des matériaux hors profondeur.
+        /// Draws des variantes du plan (LODs valides de chacune, 0 = variante désactivée), d'après le nombre d'instances de
+        /// chaque variante. Avec excludeFromDepthTexture, les draws utilisent des copies des matériaux hors profondeur.
         /// </summary>
-        public void Build(IReadOnlyList<InstanceVariant> variants, int[] lodCounts, NativeArray<int> perVariant, MeshSpawnerBehavior behavior,
+        public void Build(IReadOnlyList<InstanceVariant> variants, VariantPlan plan, NativeArray<int> perVariant, MeshSpawnerBehavior behavior,
                           float boundsPadding, bool excludeFromDepthTexture)
         {
-            int variantCount = lodCounts.Length;
-            int bucketCount = 0;
-            for (int v = 0; v < variantCount; v++)
-                bucketCount += lodCounts[v];   // <= MeshSpawner.MaxBuckets (vérifié par le spawner)
+            int[] lodCounts = plan.LodCounts;
+            int variantCount = plan.Count;
+            int bucketCount = plan.DrawCount;   // <= MeshSpawner.MaxBuckets (vérifié par le plan)
 
             Meshes = new Mesh[bucketCount];
             Materials = new Material[bucketCount];
@@ -125,7 +124,7 @@ namespace Nyx.GpuInstancing
             _offsetBuffer.SetData(Offsets);
             VisibleCapacity = validInstances;
             IndexCapacity = (int)indexSlots;
-            DeadVariant = variantCount;
+            DeadVariant = plan.DeadVariant;
             Count = bucketCount;
         }
 
@@ -140,17 +139,6 @@ namespace Nyx.GpuInstancing
             _variantBuffer = _offsetBuffer = null;
             Count = 0;
             _depthless.Release();
-        }
-
-        /// <summary>LODs utilisables d'une variante (meshes à la suite, matériau présent), 0 = variante désactivée.</summary>
-        public static int LodCount(InstanceVariant variant)
-        {
-            if (variant == null || variant.material == null || variant.lodMeshes == null)
-                return 0;
-            int count = 0;
-            while (count < variant.lodMeshes.Length && count < MeshSpawner.MaxLods && variant.lodMeshes[count] != null)
-                count++;
-            return count;
         }
 
         static Bounds LocalBounds(InstanceVariant variant, int lods)

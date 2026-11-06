@@ -173,7 +173,7 @@ Avec une eau d'asset (Crest, KWS...) : régler `Ocean Waves` pour imiter sa houl
 
 ## Fonctionnement
 
-1. À la reconstruction, les instances sont construites **sur GPU** (`InstanceBuild.compute`) : candidats (grille perturbée sur la boîte du polygone, amas, ou liste), filtrage par la zone, matrice de chaque instance écrite directement dans le buffer d'instances, dans l'ordre des candidats (masque de bits par groupe et somme préfixe). Le CPU prépare quelques paramètres et ne lit que des compteurs (total, nombre par variante, boîte des positions) pour dimensionner les buffers. Le tirage aléatoire est celui de l'ancien calcul CPU (portage exact de `Unity.Mathematics.Random`) : les scènes existantes gardent leur placement. Les colonnes de bulles sont construites de même par un noyau de `BubbleColumns.compute`. Un comportement qui écrit ses instances en C# reçoit les placements lus sur GPU, et ses instances sont envoyées une fois (`ComputeBuffer.SetData`).
+1. À la reconstruction, les instances sont construites **sur GPU** (`InstancePlacement.compute`) : candidats (grille perturbée sur la boîte du polygone, amas, ou liste), filtrage par la zone, matrice de chaque instance écrite directement dans le buffer d'instances, dans l'ordre des candidats (masque de bits par groupe et somme préfixe). Le CPU prépare quelques paramètres et ne lit que des compteurs (total, nombre par variante, boîte des positions) pour dimensionner les buffers. Le tirage aléatoire est celui de l'ancien calcul CPU (portage exact de `Unity.Mathematics.Random`) : les scènes existantes gardent leur placement. Les colonnes de bulles sont construites de même par `BubbleColumnsBuild.compute`. Un comportement qui écrit ses instances en C# reçoit les placements lus sur GPU, et ses instances sont envoyées une fois (`ComputeBuffer.SetData`), puis comptées par variante sur GPU (`InstanceVariants.compute`).
 2. Chaque frame, pour chaque caméra, le compute shader du comportement calcule la position finale de chaque instance ; avec Clip To Volume, une instance hors du volume de la zone est détruite (marquée dans le buffer d'instances) ; le culling commun rejette ce qui est hors champ (les deux yeux en VR), trop loin ou plus petit qu'un pixel, choisit le LOD et écrit chaque instance visible une seule fois, avec son index (4 octets) dans la liste de son draw.
 3. Un `DrawMeshInstancedIndirect` par (variante × LOD), pour 100 ou 1 000 000 d'instances.
 
@@ -260,14 +260,14 @@ Dans le Profiler, les sections `MeshSpawner.Rebuild`, `MeshSpawner.BuildInstance
 ## Contenu
 
 ```
-Runtime/   MeshSpawner (composant : réglages, API, cycle de vie), ZoneVolume, PlacementSetup, InstanceBuilder,
-           InstanceRenderer, DrawBuckets, DepthlessMaterials, SpawnerGpu (voir « Organisation du code »),
-           MeshSpawnerBehavior, FloatOnWaves, BubbleColumns, StaticInstances, BubbleBurstEmitter, OceanWaves,
-           ZoneShape, NyxDefaultAssets (éditeur), NyxDemoWater, NyxFlyCamera
-Shaders/   Sargassum, Bubble, Lit, DemoWater, ShaderLibrary/ (données, setup, culling, zone, hasard, vagues),
-           Resources/NyxGpuInstancing/ (un compute shader par comportement, chargé automatiquement ;
-           InstanceBuild : placement, filtrage par la zone, instances, comptage par variante)
-Editor/    inspecteur du Mesh Spawner, menus de création, scène de démo, test de fumée
+Runtime/   MeshSpawner (composant) et ses classes internes (voir « Organisation du code »),
+           MeshSpawnerBehavior, FloatOnWaves, BubbleColumns (+ BubbleBursts, BubbleColumnBuilder), StaticInstances,
+           BubbleBurstEmitter, OceanWaves, NyxDefaultAssets (éditeur), NyxDemoWater, NyxFlyCamera
+Shaders/   Sargassum, Bubble, Lit, DemoWater, ShaderLibrary/ (bibliothèques HLSL, voir « Organisation du code »),
+           Resources/NyxGpuInstancing/ : un compute shader de culling par comportement (chargé automatiquement),
+           InstancePlacement et InstanceVariants (construction), BubbleColumnsBuild (colonnes de bulles)
+Editor/    inspecteur du Mesh Spawner, poignées de la zone (vue Scene), outils, menus de création, scène de démo,
+           test de fumée
 Documentation~/Optimisations.md   journal des optimisations, mesures et images avant / après
 Defaults/  touffes, bulles, rochers, texture de fronde, matériaux
 ```
@@ -276,24 +276,39 @@ Noms propres au package (namespace `Nyx.GpuInstancing`, shaders `Nyx/GPU Instanc
 
 ## Organisation du code
 
-Le `MeshSpawner` est une coque mince : réglages sérialisés, API publique, cycle de vie Unity. Il délègue à des classes C# internes, sans état Unity, qui possèdent leurs ressources GPU :
+Le `MeshSpawner` est une coque mince : réglages sérialisés, API publique, cycle de vie Unity, orchestration de la reconstruction et du rendu. Le travail est fait par des classes C# sans état Unity, chacune avec une seule responsabilité. Chaque classe qui travaille sur GPU a son compute shader ou sa bibliothèque HLSL, et chaque calcul fait des deux côtés a son double en C#.
 
-| Classe | Rôle |
-|---|---|
-| `ZoneVolume` | Géométrie de la zone, figée à la lecture : contour (courbe ou non), bord naturel, appartenance, paramètres GPU. Calculs purs, miroir de `InstancingZone.hlsl`. |
-| `PlacementSetup` | Paramètres du placement sur GPU (grille, amas, liste, filtre de la zone), d'après les réglages. |
-| `InstanceBuilder` | Buffer d'instances : construction sur GPU (`InstanceBuild.compute`), ou instances écrites en C# puis envoyées ; placements relus à la demande. |
-| `InstanceRenderer` | Rendu par caméra : culling GPU, jeux de buffers partagés, arguments indirects, draws, destruction hors du volume. |
-| `DrawBuckets` | Les draws (variante × LOD) et la table des variantes, refaits à chaque reconstruction. |
-| `DepthlessMaterials` | Copies de matériaux hors de la texture de profondeur. |
-| `SpawnerGpu` | Dispatch « une instance par thread », lecture GPU, identifiants des propriétés, marqueurs du Profiler. |
+| Partie | C# | GPU |
+|---|---|---|
+| Polygone de la zone : contour courbe (Catmull-Rom), boîte, rectangle | `ZonePolygon` | — |
+| Bord de la zone : règle pair-impair, distance signée, bord naturel | `ZoneEdge` (public) | `InstancingZone.hlsl` |
+| Bruit du bord naturel | `ValueNoise` | `InstancingNoise.hlsl` |
+| Volume de la zone, figé : appartenance, bounds, paramètres des noyaux | `ZoneVolume` | — |
+| Zone envoyée aux noyaux (sommets, boîte, hauteurs, bord), pour le placement et la destruction | `ZoneGpu` | — |
+| Variantes : LODs, variantes dessinables, limites | `VariantPlan` | `InstancingVariants.hlsl` |
+| Placement : candidats (grille, amas, liste), filtre de la zone, instance par défaut | `PlacementSetup` | `InstancingPlacement.hlsl` |
+| Placement : comptage, somme préfixe, écriture à leur rang | `GpuPlacement` | `InstancePlacement.compute` |
+| Comptage par variante des instances écrites par un comportement | `GpuVariantCounter` | `InstanceVariants.compute` |
+| Buffer d'instances : construction GPU ou C#, placements relus à la demande | `InstanceBuilder` | — |
+| Caméra : frustum (deux yeux), distance, LOD, taille à l'écran, ombres, VR ; rejet CPU du spawner | `CameraCulling` | `InstancingCamera.hlsl` |
+| Culling par instance et compactage des visibles, arguments indirects | `InstanceRenderer` | `InstancingCulling.hlsl` (inclus par le compute du comportement) |
+| Jeux de buffers de culling partagés entre caméras, arguments par caméra | `CullingBufferPool` | — |
+| Draws (variante × LOD) et table des variantes | `DrawBuckets` | — |
+| Bounds des draws (instances, émissions en vol, limite du volume) | `DrawBounds` | — |
+| Copies de matériaux hors de la texture de profondeur | `DepthlessMaterials` | — |
+| Dispatch « une instance par thread », lecture GPU, identifiants, marqueurs du Profiler | `SpawnerGpu` | `InstancingDispatch.hlsl` |
+| Bulles : émissions ponctuelles (tampon circulaire, bounds en vol) | `BubbleBursts` | — |
+| Bulles : colonnes en boucle construites sur GPU | `BubbleColumnBuilder` | `BubbleColumnsBuild.compute` |
+
+Éditeur : `MeshSpawnerEditor` (inspecteur), `ZoneHandles` (zone dans la vue Scene), `ZoneContour` (tracé du bord naturel), `MeshSpawnerTools` (opérations par script).
 
 Règles à suivre en modifiant le package :
 
 - **Composant mince** : un MonoBehaviour garde les réglages, l'API et le cycle de vie ; le travail va dans une classe interne qui ne fait qu'une chose et libère ce qu'elle alloue.
 - **Données sur le chemin chaud** : structs, `NativeArray`, `ComputeBuffer`, aucune allocation par image (le benchmark le vérifie), aucun appel virtuel ni interface par instance. L'abstraction se place au niveau d'un spawner et d'une caméra.
 - **GPU d'abord** : le compute shader fait le travail ; un calcul fait aussi en C# (zone, hasard) sert à l'éditeur, au gameplay et aux tests.
-- **Parité testée** : tout calcul fait à la fois en HLSL et en C# a un test d'accord dans le test de fumée (modèle : `ZoneShape` / `InstancingZone.hlsl`).
+- **Un fichier, un rôle** : une classe C# ou une bibliothèque HLSL par responsabilité, un compute shader par étape GPU (culling, placement, comptage, construction d'un comportement). Les noms vont par paires : `ZoneEdge` / `InstancingZone.hlsl`, `CameraCulling` / `InstancingCamera.hlsl`, `GpuPlacement` / `InstancePlacement.compute`.
+- **Parité testée** : tout calcul fait à la fois en HLSL et en C# a un test d'accord dans le test de fumée (modèle : `ZoneEdge` / `InstancingZone.hlsl`).
 - **Comportements = stratégie** : le mouvement vient d'un `MeshSpawnerBehavior`, jamais d'un `if` sur le type dans le spawner.
 - **Sérialisation stable** : ne pas renommer ni déplacer un champ sérialisé sans `[FormerlySerializedAs]` ; les scènes existantes doivent s'ouvrir telles quelles.
 - **Refactor sans changement de résultat** : mêmes instances, mêmes images. Outil : `Assets/DevTools/Editor/RefactorParityCheck.cs` (`SaveReference` avant, `Compare` après : placements, draws, mémoire, zone et image identiques, instances à quelques ulp près), puis test de fumée et benchmark.

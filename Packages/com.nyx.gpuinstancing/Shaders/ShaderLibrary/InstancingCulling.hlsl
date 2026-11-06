@@ -8,8 +8,8 @@
 //     bool NyxEvaluateInstance(uint index, NyxInstanceData src, out NyxRenderData dst)
 // qui calcule la matrice finale de l'instance (animation, flottaison...) et renvoie false si elle est morte.
 //
-// Par caméra et par frame :
-//   NyxCull      : 1 thread par instance -> évaluation, distance, petits objets, frustum (2 yeux), LOD,
+// Par caméra et par frame (InstanceRenderer.cs) :
+//   NyxCull      : 1 thread par instance -> évaluation, destruction hors du volume, visibilité et LOD (NyxSelectBucket),
 //                  puis écriture des données de rendu UNE fois dans _NyxVisible (compacté, toutes variantes),
 //                  et de leur index (4 octets) dans la zone du draw (variante x LOD) de _NyxVisibleIndex.
 //   NyxWriteArgs : 1 thread par draw -> nombre d'instances dans les arguments indirects, remise à zéro.
@@ -18,50 +18,38 @@
 // Volume de la zone (MeshSpawner.ClipToVolume) : une instance dont la position évaluée sort du polygone extrudé est
 // détruite : sa variante devient la variante désactivée dans _NyxInstances, jusqu'au prochain envoi de cette instance
 // (reconstruction, ou mise à jour partielle comme Emit des bulles). Les instances détruites ne sont plus évaluées.
+//
+// Briques : InstancingCamera.hlsl (frustum, distance, LOD), InstancingZone.hlsl (volume), InstancingVariants.hlsl
+// (variante désactivée), InstancingDispatch.hlsl (une instance par thread).
 
 #include "InstancingData.hlsl"
-#include "InstancingZone.hlsl"   // _NyxZone*, NyxInsideZone
+#include "InstancingDispatch.hlsl"   // NYX_THREADS, NyxInstanceIndex
+#include "InstancingVariants.hlsl"   // _NyxDeadVariant
+#include "InstancingCamera.hlsl"     // _NyxCameraPosition, _NyxCullParams, NyxCameraSeesBox
+#include "InstancingZone.hlsl"       // _NyxZone*, NyxInsideZone
 
-#define NYX_THREADS 64            // = MeshSpawner.ThreadGroupSize
 #define NYX_MAX_BUCKETS 64        // = MeshSpawner.MaxBuckets
 
-RWStructuredBuffer<NyxInstanceData> _NyxInstances;     // écrit seulement pour détruire une instance (custom.w)
+// Table des draws (DrawBuckets.cs)
 StructuredBuffer<NyxVariantInfo>   _NyxVariants;
 StructuredBuffer<uint>             _NyxBucketOffsets;   // début de la zone d'index de chaque draw
+uint                               _NyxBucketCount;
+
+// Instances et sorties (CullingBufferPool.cs)
+RWStructuredBuffer<NyxInstanceData> _NyxInstances;     // écrit seulement pour détruire une instance (custom.w)
+uint                               _NyxInstanceCount;
 RWStructuredBuffer<NyxRenderData>  _NyxVisible;         // données de rendu des instances visibles, compactées
 RWStructuredBuffer<uint>           _NyxVisibleIndex;    // par draw : index dans _NyxVisible
 RWStructuredBuffer<uint>           _NyxCounters;        // [draw] : instances du draw ; [_NyxBucketCount] : total visible
 // Buffer de type IndirectArguments : vue DX11 typée R32_UINT, donc RWBuffer<uint> et non RWStructuredBuffer.
 RWBuffer<uint>                     _NyxArgs;
 
-uint   _NyxInstanceCount;
-uint   _NyxBucketCount;
-uint   _NyxGroupsX;             // groupes en X (dispatch 2D au-delà de 65 535 groupes)
-uint   _NyxInstanceMultiplier;  // 2 en VR Single Pass Instanced, sinon 1
-uint   _NyxPlaneSetCount;       // 1 = mono, 2 = stéréo (union des frustums des deux yeux)
-float4 _NyxFrustumPlanes[12];   // normales tournées vers l'intérieur
-float4 _NyxCameraPosition;      // xyz : position caméra, w : distance max²
-float4 _NyxCullParams;          // x : 1 / lodBias², y : (taille écran mini / échelle de projection)²
-float4 _NyxShadowSweep;         // xyz : demi-vecteur d'extrusion le long de la lumière (0 sans ombres)
-uint   _NyxDeadVariant;         // variante désactivée (= nombre de variantes) : instance invalide ou détruite
-
 groupshared uint gs_Count[NYX_MAX_BUCKETS];
 groupshared uint gs_Base[NYX_MAX_BUCKETS];
 groupshared uint gs_Total;
 groupshared uint gs_TotalBase;
 
-bool NyxAabbInsidePlanes(float3 center, float3 extents, uint firstPlane)
-{
-    [unroll]
-    for (uint p = 0; p < 6; p++)
-    {
-        float4 plane = _NyxFrustumPlanes[firstPlane + p];
-        if (dot(plane.xyz, center) + plane.w < -dot(abs(plane.xyz), extents))
-            return false;
-    }
-    return true;
-}
-
+// Instance visible par la caméra ? Si oui, 'bucket' = son draw (variante x LOD).
 bool NyxSelectBucket(NyxInstanceData src, NyxRenderData dst, out uint bucket)
 {
     bucket = 0;
@@ -85,13 +73,8 @@ bool NyxSelectBucket(NyxInstanceData src, NyxRenderData dst, out uint bucket)
     if (dot(extents, extents) < distSq * _NyxCullParams.y)
         return false;
 
-    // 3. Frustum. Avec ombres, l'AABB est étirée le long de la lumière pour garder les projeteurs hors champ.
-    float3 cullCenter  = center + _NyxShadowSweep.xyz;
-    float3 cullExtents = extents + abs(_NyxShadowSweep.xyz);
-    bool visible = NyxAabbInsidePlanes(cullCenter, cullExtents, 0);
-    if (!visible && _NyxPlaneSetCount > 1)
-        visible = NyxAabbInsidePlanes(cullCenter, cullExtents, 6);
-    if (!visible)
+    // 3. Frustum (deux yeux en stéréo, étiré le long de la lumière avec ombres)
+    if (!NyxCameraSeesBox(center, extents))
         return false;
 
     // 4. LOD par distance (seuils triés, les LODs absents valent +infini)
@@ -115,7 +98,7 @@ void NyxCull(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
         gs_Total = 0;
     GroupMemoryBarrierWithGroupSync();
 
-    uint instanceIndex = (groupId.y * _NyxGroupsX + groupId.x) * NYX_THREADS + threadIndex;
+    uint instanceIndex = NyxInstanceIndex(groupId, groupThreadId);
     bool visible = false;
     uint bucket = 0;
     uint slotInGroup = 0;

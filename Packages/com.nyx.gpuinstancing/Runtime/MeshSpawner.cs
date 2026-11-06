@@ -31,11 +31,14 @@ namespace Nyx.GpuInstancing
     /// Le MeshSpawner gère le reste : meshes et LODs, placement (zone, amas, liste), culling (frustum des deux yeux,
     /// distance, petits objets), buffers, VR, ombres.
     ///
-    /// Ce composant garde les réglages, l'API et le cycle de vie Unity, et délègue le travail à des classes sans état Unity :
-    ///  - <see cref="ZoneVolume"/> : géométrie de la zone (contour, bord naturel, appartenance), même calcul que le GPU ;
-    ///  - <see cref="PlacementSetup"/> : paramètres du placement sur GPU, d'après les réglages ;
-    ///  - <see cref="InstanceBuilder"/> : buffer d'instances, construit sur GPU (ou écrit en C# puis envoyé) ;
-    ///  - <see cref="InstanceRenderer"/> : rendu par caméra (culling GPU, draws), avec ses <see cref="DrawBuckets"/>.
+    /// Ce composant garde les réglages, l'API et le cycle de vie Unity, et orchestre des classes sans état Unity :
+    ///  - zone : <see cref="ZoneVolume"/> (volume figé), <see cref="ZonePolygon"/> (contour), <see cref="ZoneEdge"/> (bord,
+    ///    même calcul que le GPU), <see cref="ZoneGpu"/> (paramètres des noyaux) ;
+    ///  - construction : <see cref="VariantPlan"/> (variantes), <see cref="PlacementSetup"/> (placement),
+    ///    <see cref="InstanceBuilder"/> (buffer d'instances) avec <see cref="GpuPlacement"/> et <see cref="GpuVariantCounter"/> ;
+    ///  - rendu : <see cref="InstanceRenderer"/> (par caméra) avec <see cref="CameraCulling"/>, <see cref="CullingBufferPool"/>,
+    ///    <see cref="DrawBuckets"/> ; <see cref="DrawBounds"/> (bounds des draws).
+    /// Chaque classe GPU a son compute shader ou sa bibliothèque HLSL (README, « Organisation du code »).
     ///
     /// Mémoire : CPU, rien de proportionnel au nombre d'instances n'est retenu (placements lus seulement à la demande) ;
     /// GPU, instances (64 o chacune) + un jeu de buffers de culling partagé par les caméras. Détails dans InstanceBuilder
@@ -67,7 +70,7 @@ namespace Nyx.GpuInstancing
         public const int MaxLods = 4;
         public const int MaxBuckets = 64;           // = NYX_MAX_BUCKETS (InstancingCulling.hlsl)
 
-        /// <summary>Variantes maximum d'un spawner (= NYX_MAX_VARIANTS, InstanceBuild.compute).</summary>
+        /// <summary>Variantes maximum d'un spawner (= NYX_MAX_VARIANTS, InstancingVariants.hlsl).</summary>
         public const int MaxVariants = 64;
 
         /// <summary>
@@ -158,16 +161,14 @@ namespace Nyx.GpuInstancing
 
         readonly InstanceBuilder _builder = new InstanceBuilder();
         readonly InstanceRenderer _renderer = new InstanceRenderer();
+        readonly DrawBounds _bounds = new DrawBounds();
         readonly List<Vector3> _anchorPositions = new List<Vector3>();   // ancres au dernier placement (suivies en mode édition)
+        readonly List<string> _variantWarnings = new List<string>();
         MeshSpawnerBehavior _behavior;
         bool _built;
         bool _dirty = true;
         bool _warnedUnsupported;
         bool _warnedNoBehavior;
-        Bounds _buildBounds;          // instances à la reconstruction (mouvement du comportement compris)
-        Bounds? _dynamicBounds;       // émissions en vol (SetDynamicBounds)
-        Bounds? _zoneDrawBounds;      // volume agrandi de la taille des meshes : limite les bounds du draw
-        Bounds _worldBounds;          // bounds des draws et du rejet CPU du spawner entier
 
         // ------------------------------------------------------------------------------------------
         // API
@@ -413,11 +414,7 @@ namespace Nyx.GpuInstancing
         }
 
         /// <summary>Bounds supplémentaires qui évoluent sans reconstruction (ex. émissions en vol). null = aucune.</summary>
-        public void SetDynamicBounds(Bounds? bounds)
-        {
-            _dynamicBounds = bounds;
-            UpdateWorldBounds();
-        }
+        public void SetDynamicBounds(Bounds? bounds) => _bounds.SetDynamic(bounds);
 
         /// <summary>
         /// DIAGNOSTIC / TESTS : instances visibles par draw au dernier rendu de 'camera'.
@@ -442,15 +439,15 @@ namespace Nyx.GpuInstancing
         [ContextMenu("Figer le placement procédural dans la liste")]
         public void FreezePlacement()
         {
-            if (!SystemInfo.supportsComputeShaders || !InstanceBuilder.LoadShader())
+            if (!SystemInfo.supportsComputeShaders || !GpuPlacement.LoadShader())
             {
-                Debug.LogError($"{name} : placement impossible sans compute shaders ({InstanceBuilder.ShaderResource}).", this);
+                Debug.LogError($"{name} : placement impossible sans compute shaders ({GpuPlacement.ShaderResource}).", this);
                 return;
             }
 #if UNITY_EDITOR
             UnityEditor.Undo.RecordObject(this, "Figer le placement");
 #endif
-            NativeArray<MeshPlacement> generated = InstanceBuilder.ReadPlacements(PreparePlacement(), Allocator.Persistent);
+            NativeArray<MeshPlacement> generated = GpuPlacement.ReadPlacements(PreparePlacement(), Allocator.Persistent);
             placements = new List<MeshPlacement>(generated.ToArray());
             generated.Dispose();
             source = PlacementSource.List;
@@ -624,7 +621,7 @@ namespace Nyx.GpuInstancing
             if (!_built || InstanceCount == 0 || _renderer.Draws.Count == 0 || behavior == null)
                 return;
 
-            _renderer.Render(this, camera, settings, behavior, _builder.Instances, InstanceCount, _worldBounds);
+            _renderer.Render(this, camera, settings, behavior, _builder.Instances, InstanceCount, _bounds.World);
         }
 
         CullingSettings ReadCullingSettings() => new CullingSettings
@@ -642,21 +639,6 @@ namespace Nyx.GpuInstancing
             renderInSceneView = renderInSceneView,
             logVisibleCounts = logVisibleCounts
         };
-
-        void UpdateWorldBounds()
-        {
-            _worldBounds = _buildBounds;
-            if (_dynamicBounds.HasValue)
-                _worldBounds.Encapsulate(_dynamicBounds.Value);
-            if (_zoneDrawBounds.HasValue)
-            {
-                // Les instances détruites hors du volume ne sont jamais dessinées : le draw tient dans le volume
-                Bounds zone = _zoneDrawBounds.Value;
-                Vector3 min = Vector3.Max(_worldBounds.min, zone.min);
-                Vector3 max = Vector3.Max(min, Vector3.Min(_worldBounds.max, zone.max));
-                _worldBounds.SetMinMax(min, max);
-            }
-        }
 
         // ------------------------------------------------------------------------------------------
         // Reconstruction (toujours hors rendu, sauf la toute première)
@@ -682,9 +664,9 @@ namespace Nyx.GpuInstancing
             _warnedNoBehavior = false;
             if (!SystemInfo.supportsComputeShaders)
                 return;   // signalé au rendu : rien ne serait dessiné
-            if (!InstanceBuilder.LoadShader())
+            if (!InstanceBuilder.LoadShaders())
             {
-                Debug.LogError($"{name} : compute shader {InstanceBuilder.ShaderResource} introuvable ou invalide (dossier Resources du package).", this);
+                Debug.LogError($"{name} : compute shaders {InstanceBuilder.ShaderResources} introuvables ou invalides (dossier Resources du package).", this);
                 return;
             }
             if (!_renderer.UseShader(behavior.CullingShader))
@@ -692,24 +674,22 @@ namespace Nyx.GpuInstancing
                 Debug.LogError($"{name} : le comportement {behavior.GetType().Name} ne fournit pas de compute shader de culling.", this);
                 return;
             }
-            if (!CheckVariants(out int[] lodCounts, out uint validLow, out uint validHigh))
+            VariantPlan plan = PlanVariants();
+            if (plan == null)
                 return;
 
-            _renderer.SetZone(Zone, clipToVolume);
-            _zoneDrawBounds = null;
+            _renderer.SetZone(clipToVolume ? Zone.ToGpu(withFeather: false) : ZoneGpu.Disabled());   // destruction : bord, sans lisière
             MotionExceedsVolumeHeight = false;
-            _builder.SetVariants(variants.Count, validLow, validHigh);
 
             // Instances construites sur GPU (ou écrites en C# puis envoyées), et leur nombre par variante. Une variante
             // invalide (mesh/matériau manquant) pointe vers une variante "désactivée" : les index restent stables.
-            var perVariant = new NativeArray<int>(variants.Count, Allocator.Temp);
+            var perVariant = new NativeArray<int>(plan.Count, Allocator.Temp);
             try
             {
                 int instanceCount;
                 using (SpawnerMarkers.BuildInstances.Auto())
-                    instanceCount = behavior.UsesPlacement ? BuildPlacedInstances(behavior, perVariant) : BuildBehaviorInstances(behavior, perVariant);
-                UpdateWorldBounds();
-                _renderer.Draws.Build(variants, lodCounts, perVariant, behavior, boundsPadding, excludeFromDepthTexture);
+                    instanceCount = behavior.UsesPlacement ? BuildPlacedInstances(behavior, plan, perVariant) : BuildBehaviorInstances(behavior, plan, perVariant);
+                _renderer.Draws.Build(variants, plan, perVariant, behavior, boundsPadding, excludeFromDepthTexture);
                 InstanceCount = instanceCount;
                 _built = true;
             }
@@ -719,74 +699,40 @@ namespace Nyx.GpuInstancing
             }
         }
 
-        /// <summary>
-        /// LODs utilisables de chaque variante (0 = variante désactivée) et variantes dessinables (bits 0..31, 32..63).
-        /// false, avec une erreur, si les limites de variantes ou de draws sont dépassées.
-        /// </summary>
-        bool CheckVariants(out int[] lodCounts, out uint validLow, out uint validHigh)
+        /// <summary>Variantes de la reconstruction. null, avec une erreur, si les limites de variantes ou de draws sont dépassées.</summary>
+        VariantPlan PlanVariants()
         {
-            lodCounts = null;
-            validLow = validHigh = 0;
-            int variantCount = variants.Count;
-            if (variantCount > MaxVariants)
-            {
-                Debug.LogError($"{name} : {variantCount} variantes > {MaxVariants}. Réduisez les variantes.", this);
-                return false;
-            }
-            lodCounts = new int[variantCount];
-            int bucketCount = 0;
-            for (int v = 0; v < variantCount; v++)
-            {
-                lodCounts[v] = DrawBuckets.LodCount(variants[v]);
-                bucketCount += lodCounts[v];
-                if (lodCounts[v] == 0)
-                    continue;
-                if (v < 32)
-                    validLow |= 1u << v;
-                else
-                    validHigh |= 1u << (v - 32);
-                // Avec « Instancing Variants : Strip Unused » (réglage par défaut), un build supprime les variantes
-                // instanciées des shaders dont aucun matériau n'a l'instancing coché : rien ne s'afficherait.
-                if (!variants[v].material.enableInstancing)
-                    Debug.LogWarning($"{name} : cochez « Enable GPU Instancing » sur le matériau '{variants[v].material.name}', sinon rien ne s'affichera dans les builds.", this);
-            }
-            if (bucketCount > MaxBuckets)
-            {
-                Debug.LogError($"{name} : {bucketCount} draws (variantes × LODs) > {MaxBuckets}. Réduisez les variantes ou les LODs.", this);
-                return false;
-            }
-            return true;
+            _variantWarnings.Clear();
+            VariantPlan plan = VariantPlan.Create(variants, _variantWarnings, out string error);
+            foreach (string warning in _variantWarnings)
+                Debug.LogWarning($"{name} : {warning}", this);
+            if (plan == null)
+                Debug.LogError($"{name} : {error}", this);
+            return plan;
         }
 
         /// <summary>
         /// Instances du placement (zone, amas, liste). Bounds : boîte des pivots élargie de la taille des meshes et du mouvement
         /// du comportement ; avec Clip To Volume, les draws sont en plus limités au volume.
         /// </summary>
-        int BuildPlacedInstances(MeshSpawnerBehavior behavior, NativeArray<int> perVariant)
+        int BuildPlacedInstances(MeshSpawnerBehavior behavior, VariantPlan plan, NativeArray<int> perVariant)
         {
-            int count = _builder.BuildPlaced(behavior, PreparePlacement(), perVariant, out Bounds positions, out float maxScale);
-            _buildBounds = new Bounds(transform.position, Vector3.one);
+            int count = _builder.BuildPlaced(behavior, PreparePlacement(), plan, perVariant, out Bounds positions, out float maxScale);
             if (count == 0)
-                return 0;
-
-            float meshExtent = (MaxVariantRadius() + boundsPadding) * maxScale;
-            _buildBounds = behavior.GetPlacementBounds(positions, meshExtent);
-            if (clipToVolume)
             {
-                Bounds volume = Zone.WorldBounds();
-                Bounds motion = behavior.GetPlacementBounds(positions, 0f);   // pivots seulement
-                MotionExceedsVolumeHeight = motion.max.y > volume.max.y + ZoneVolume.HeightTolerance || motion.min.y < volume.min.y - ZoneVolume.HeightTolerance;
-                volume.Expand(meshExtent * 2f);
-                _zoneDrawBounds = volume;
+                _bounds.SetEmpty(transform.position);
+                return 0;
             }
+            float meshExtent = (MaxVariantRadius() + boundsPadding) * maxScale;
+            MotionExceedsVolumeHeight = _bounds.SetPlaced(behavior, positions, meshExtent, clipToVolume ? Zone.WorldBounds() : (Bounds?)null);
             return count;
         }
 
         /// <summary>Instances propres au comportement (UsesPlacement = false), avec leurs bounds.</summary>
-        int BuildBehaviorInstances(MeshSpawnerBehavior behavior, NativeArray<int> perVariant)
+        int BuildBehaviorInstances(MeshSpawnerBehavior behavior, VariantPlan plan, NativeArray<int> perVariant)
         {
-            int count = _builder.BuildFromBehavior(behavior, perVariant, out Bounds bounds);
-            _buildBounds = bounds;
+            int count = _builder.BuildFromBehavior(behavior, plan, perVariant, out Bounds bounds);
+            _bounds.SetBehavior(bounds);
             return count;
         }
 

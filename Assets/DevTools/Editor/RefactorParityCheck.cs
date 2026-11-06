@@ -18,7 +18,9 @@ using Object = UnityEngine.Object;
 ///  2. Après : Compare (parity/compare.txt). Tout doit être identique, sauf les instances, comparées à quelques ulp près :
 ///     le pilote peut calculer le sinus / cosinus du GPU un peu différemment d'une exécution à l'autre (~1e-6, mesuré sur
 ///     GTX 1060), placements identiques.
-/// Scène vide temporaire, puis la scène active est rouverte ; refuse de tourner si une scène ouverte n'est pas enregistrée.
+/// Scène additive temporaire, refermée sans enregistrer : les scènes ouvertes ne sont pas touchées (modifications non
+/// enregistrées comprises). Leurs lumières éclairent aussi l'image des rochers : garder les mêmes scènes ouvertes entre
+/// SaveReference et Compare (la 2e ligne du résumé les liste).
 /// invoke.request « RefactorParityCheck, Assembly-CSharp-Editor|SaveReference » (ou Compare).
 /// </summary>
 static class RefactorParityCheck
@@ -118,17 +120,13 @@ static class RefactorParityCheck
         Directory.CreateDirectory(output);
         foreach (string old in Directory.GetFiles(output, "*.bin"))
             File.Delete(old);
-        var lines = new List<string> { $"{SystemInfo.graphicsDeviceName}" };
+        var open = new List<string>();
         for (int i = 0; i < SceneManager.sceneCount; i++)
-        {
-            if (SceneManager.GetSceneAt(i).isDirty)
-            {
-                File.WriteAllLines(Path.Combine(output, SummaryFile), new[] { $"ARRÊT : la scène {SceneManager.GetSceneAt(i).path} n'est pas enregistrée." });
-                return false;
-            }
-        }
-        string previous = SceneManager.GetActiveScene().path;
-        EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);   // rien d'autre n'éclaire les rochers
+            open.Add(SceneManager.GetSceneAt(i).path);
+        var lines = new List<string> { $"{SystemInfo.graphicsDeviceName}", $"scènes ouvertes : {string.Join(", ", open)}" };
+        Scene previous = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        SceneManager.SetActiveScene(scene);
         bool onGpu = MeshSpawner.CreateInstancesOnGpu;
         bool asyncCompilation = ShaderUtil.allowAsyncCompilation;
         ShaderUtil.allowAsyncCompilation = false;
@@ -214,8 +212,9 @@ static class RefactorParityCheck
         {
             MeshSpawner.CreateInstancesOnGpu = onGpu;
             ShaderUtil.allowAsyncCompilation = asyncCompilation;
-            if (!string.IsNullOrEmpty(previous))
-                EditorSceneManager.OpenScene(previous);
+            if (previous.IsValid())
+                SceneManager.SetActiveScene(previous);
+            EditorSceneManager.CloseScene(scene, true);
         }
         File.WriteAllLines(Path.Combine(output, SummaryFile), lines);
         return true;

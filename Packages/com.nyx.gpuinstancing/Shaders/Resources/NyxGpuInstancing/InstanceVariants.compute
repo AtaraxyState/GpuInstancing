@@ -1,0 +1,40 @@
+// Instances écrites par un comportement (en C#, ou sur GPU comme les bulles) : nombre d'instances par variante
+// (GpuVariantCounter.cs, à la reconstruction). Une instance dont la variante n'est pas dessinable passe à la variante
+// désactivée : les index restent stables pour les mises à jour partielles.
+#pragma kernel NyxCountVariants
+
+#include "../../ShaderLibrary/InstancingData.hlsl"
+#include "../../ShaderLibrary/InstancingDispatch.hlsl"   // NYX_THREADS, NyxInstanceIndex
+#include "../../ShaderLibrary/InstancingVariants.hlsl"   // NYX_MAX_VARIANTS, NyxVariantValid, _NyxDeadVariant
+
+#if NYX_THREADS != NYX_MAX_VARIANTS
+#error Un compteur de variante par thread : NYX_THREADS doit valoir NYX_MAX_VARIANTS.
+#endif
+
+RWStructuredBuffer<NyxInstanceData> _NyxInstances;
+uint                                _NyxInstanceCount;
+RWStructuredBuffer<uint>            _NyxVariantCounts;   // NYX_MAX_VARIANTS compteurs, à zéro avant le dispatch
+
+groupshared uint gs_Variants[NYX_MAX_VARIANTS];
+
+[numthreads(NYX_THREADS, 1, 1)]
+void NyxCountVariants(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint t = threadId.x;
+    gs_Variants[t] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint index = NyxInstanceIndex(groupId, threadId);
+    if (index < _NyxInstanceCount)
+    {
+        int variant = (int)_NyxInstances[index].custom.w;
+        if (variant >= 0 && NyxVariantValid((uint)variant))
+            InterlockedAdd(gs_Variants[variant], 1);
+        else
+            _NyxInstances[index].custom.w = (float)_NyxDeadVariant;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gs_Variants[t] > 0)
+        InterlockedAdd(_NyxVariantCounts[t], gs_Variants[t]);
+}
